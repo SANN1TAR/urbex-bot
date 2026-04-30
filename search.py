@@ -1,6 +1,6 @@
 # Поиск объектов через Tavily + Groq
 # Получает: тип объекта (zabroshka/roof), город, список уже показанных
-# Отдаёт: список объектов с названием, координатами/адресом, описанием, фото
+# Отдаёт: список объектов с координатами/адресом, описанием, фото
 
 import asyncio
 import json
@@ -8,7 +8,6 @@ import logging
 import os
 import re
 
-import httpx
 from groq import Groq
 from tavily import TavilyClient
 from dotenv import load_dotenv
@@ -19,20 +18,20 @@ logger = logging.getLogger(__name__)
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
-TYPE_NAMES = {"zabroshka": "заброшка", "roof": "крыша для руфинга"}
-
 QUERIES = {
     "zabroshka": [
-        "заброшка адрес координаты охрана урбекс",
-        "urbex заброшенное здание вход координаты",
-        "заброшка описание место улица",
+        "заброшка здание урбекс адрес координаты",
+        "urbex заброшенное здание вход описание",
+        "заброшка строение улица охрана",
     ],
     "roof": [
-        "руф многоэтажка крыша залаз координаты",
-        "руфинг точка высотка адрес как попасть",
-        "крышелазание жилой дом открытая крыша",
+        "руф многоэтажка здание крыша залаз",
+        "руфинг высотка здание адрес как попасть",
+        "крышелазание дом здание открытая крыша",
     ],
 }
+
+NO_LIST = "Нельзя: МГУ, Кремль, телебашни, Москва-Сити, ВДНХ, Останкино, госучреждения, ФСБ объекты."
 
 _counters: dict = {}
 
@@ -53,11 +52,15 @@ def _clean(text: str) -> str:
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 
-def _sort_by_date(results: list) -> list:
-    def key(r):
-        priority = 0 if "wikimapia" in r.get("url", "") else 1
-        return (priority, r.get("published_date") or "")
-    return sorted(results, key=key)
+def _sort(results: list) -> list:
+    return sorted(results, key=lambda r: (
+        0 if "wikimapia" in r.get("url", "") else 1,
+        r.get("published_date") or ""
+    ))
+
+
+def _fmt_results(results: list) -> str:
+    return "\n".join(f"- {r['title']}: {r['content']}" for r in results)
 
 
 def _tavily(query: str, images: bool = False) -> dict:
@@ -72,37 +75,15 @@ def _groq(prompt: str) -> str:
     ).choices[0].message.content
 
 
-async def _get_photo(name: str, city: str) -> str:
-    # 1. Tavily с картинками
+async def _get_photo(name: str, city: str, obj_type: str) -> str:
+    suffix = "здание фасад заброшка" if obj_type == "zabroshka" else "высотка здание крыша"
     try:
-        r = await asyncio.to_thread(_tavily, f"{name} {city} фото", True)
+        r = await asyncio.to_thread(_tavily, f"{name} {city} {suffix}", True)
         imgs = r.get("images", [])
         if imgs:
             return imgs[0]
     except Exception:
         pass
-
-    # 2. Wikimedia Commons
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get("https://commons.wikimedia.org/w/api.php", params={
-                "action": "query", "list": "search",
-                "srsearch": f"{name} abandoned", "srnamespace": "6",
-                "format": "json", "srlimit": 1,
-            })
-            hits = r.json().get("query", {}).get("search", [])
-            if hits:
-                r2 = await client.get("https://commons.wikimedia.org/w/api.php", params={
-                    "action": "query", "titles": hits[0]["title"],
-                    "prop": "imageinfo", "iiprop": "url", "format": "json",
-                })
-                for page in r2.json().get("query", {}).get("pages", {}).values():
-                    info = page.get("imageinfo", [])
-                    if info:
-                        return info[0].get("url", "")
-    except Exception:
-        pass
-
     return ""
 
 
@@ -113,77 +94,69 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
     _counters[key] = counter + 1
 
     response = await asyncio.to_thread(_tavily, f"{query_base} {city}")
-    results = _sort_by_date(response.get("results", []))
-    logger.info(f"Tavily вернул {len(results)} результатов для '{query_base} {city}'")
+    results = _sort(response.get("results", []))
+    logger.info(f"Tavily: {len(results)} результатов для '{query_base} {city}'")
 
     if not results:
         return []
 
-    exclude = f"Уже показанные объекты — НЕ включай их: {', '.join(shown)}.\n" if shown else ""
-
-    no_list = "Нельзя: МГУ, Кремль, телебашни, Москва-Сити, ВДНХ, Останкино, госучреждения, охраняемые ФСБ объекты."
+    exclude = f"Уже показаны — не повторяй: {', '.join(shown)}. " if shown else ""
 
     if obj_type == "roof":
-        task = f"Найди 3 точки для руфинга (крыша многоэтажки) в {city}. {no_list} Только обычные жилые/нежилые высотки. {exclude}"
+        task = f"Найди 3 точки для руфинга (крыша жилой/нежилой высотки) в {city}. {NO_LIST} Не аренда, не рестораны. {exclude}"
     else:
-        task = f"Найди 3 заброшенных объекта в {city}. {no_list} Только малоизвестные реально заброшенные места. {exclude}"
-
-    results_text = "\n".join(f"- {r['title']}: {r['content']} (URL: {r['url']})" for r in results)
+        task = f"Найди 3 заброшенных здания или объекта в {city}. {NO_LIST} Малоизвестные реальные заброшки. {exclude}"
 
     prompt = f"""{task}
 
-Для каждого объекта:
-- name: название
-- coords: координаты "55.7558, 37.6173" — ищи в тексте, если нет — попробуй вспомнить по названию места. Если совсем никак — не включай
-- address: улица и дом или район — только если нет coords. Если знаешь только город — не включай
-- description: состояние, атмосфера, особенности (без ссылок и названий сайтов)
-- security: охрана/залаз — если есть инфа. Если нет — не включай
+Для каждого:
+- name: название здания/объекта
+- coords: координаты "55.7558, 37.6173" (ищи в тексте или вспомни по адресу, иначе не включай)
+- address: улица и дом или район (только если нет coords, только если точнее чем просто город)
+- description: состояние, что внутри/снаружи, атмосфера. Без ссылок и названий сайтов.
+- security: охрана, залаз, камеры (только если есть инфа)
 
-Результаты поиска:
-{results_text}
+Данные:
+{_fmt_results(results)}
 
-Ответь строго JSON массивом:
+JSON массив без лишнего текста:
 [{{"name":"...","coords":"...","address":"...","description":"...","security":"..."}}]
 
-Если объектов меньше 3 — дай сколько есть. Если нет — верни [].
+Меньше 3 — дай сколько есть. Нет ничего — верни [].
 """
 
     text = await asyncio.to_thread(_groq, prompt)
+    logger.info(f"Groq: {text[:150]}")
 
-    logger.info(f"Groq ответил: {text[:200]}")
     try:
         objects = _parse_json(text)
-        logger.info(f"Найдено объектов: {len(objects)}")
         for i, obj in enumerate(objects):
-            if i < len(results):
-                obj["published_date"] = results[i].get("published_date", "")
+            obj["published_date"] = results[i].get("published_date", "") if i < len(results) else ""
             obj["description"] = _clean(obj.get("description", ""))
             obj["security"] = _clean(obj.get("security", ""))
-            obj["image"] = await _get_photo(obj.get("name", ""), city)
+            obj["image"] = await _get_photo(obj.get("name", ""), city, obj_type)
         return objects
     except Exception:
         return []
 
 
 async def search_by_name(name: str, city: str) -> dict:
-    response = await asyncio.to_thread(_tavily, f"{name} {city} заброшка крыша wikimapia", True)
-    results = _sort_by_date(response.get("results", []))
+    response = await asyncio.to_thread(_tavily, f"{name} {city} заброшка крыша", True)
+    results = _sort(response.get("results", []))
     images = response.get("images", [])
 
     if not results:
         return {"not_found": True}
 
-    results_text = "\n".join(f"- {r['title']}: {r['content']} (URL: {r['url']})" for r in results)
+    prompt = f"""Найди инфу об объекте "{name}" в {city}.
 
-    prompt = f"""Найди информацию об объекте "{name}" в городе {city}.
+Данные:
+{_fmt_results(results)}
 
-Результаты:
-{results_text}
-
-Ответь строго JSON:
+JSON без лишнего текста:
 {{"name":"...","coords":"...","address":"...","description":"..."}}
 
-Если не найдено — верни: {{"not_found":true}}
+Не найдено — верни: {{"not_found":true}}
 """
 
     text = await asyncio.to_thread(_groq, prompt)
@@ -192,7 +165,7 @@ async def search_by_name(name: str, city: str) -> dict:
         result = _parse_json(text)
         if not result.get("not_found"):
             result["description"] = _clean(result.get("description", ""))
-            result["image"] = images[0] if images else await _get_photo(name, city)
+            result["image"] = images[0] if images else await _get_photo(name, city, "zabroshka")
         return result
     except Exception:
         return {"not_found": True}
