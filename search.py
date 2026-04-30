@@ -18,17 +18,14 @@ logger = logging.getLogger(__name__)
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
-TYPE_NAMES = {"zabroshka": "заброшка", "roof": "крыша для руфинга"}
 NO_LIST = "Нельзя: МГУ, Кремль, телебашни, Москва-Сити, ВДНХ, Останкино, госучреждения."
 
-# Иерархия источников — от приоритетного к общему
 SOURCES = [
     "site:wikimapia.org",
     "site:urbantrip.ru",
-    "site:t.me OR site:telegram.me",
+    "site:t.me",
     "site:vk.com",
-    "site:instagram.com OR site:youtube.com",
-    "",  # общий поиск как последний резерв
+    "",
 ]
 
 BASE_QUERIES = {
@@ -50,24 +47,22 @@ def _parse_json(text: str):
 
 
 def _clean(text: str) -> str:
+    if not text:
+        return ""
     text = re.sub(r'https?://\S+', '', text)
-    text = re.sub(r'\b\w+\.(ru|com|org|net|io)\b', '', text)
+    text = re.sub(r'\b\w+\.(ru|com|org|net|io)\b', '', text, flags=re.IGNORECASE)
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 
-_BAD_ADDR = re.compile(
-    r'^(центр|центре|рядом|около|у\s|вблизи|недалеко|неподалёку|неподалеку|район|'
-    r'московск|москва$|санкт-петербург$|питер$|екатеринбург$)',
-    re.IGNORECASE
-)
-
-
-def _validate_address(addr: str) -> str:
+def _clean_address(addr: str, city: str) -> str:
     if not addr:
         return ""
-    # Убираем если адрес слишком общий (нет цифры и нет "ул"/"пр"/"пер"/"наб")
-    has_street = bool(re.search(r'(ул\.|пр\.|пер\.|наб\.|бул\.|ш\.|пл\.|тупик|\d)', addr))
-    if not has_street or _BAD_ADDR.match(addr.strip()):
+    bad = re.compile(
+        r'^(центр\s+\w+|у\s+\w+|рядом|около|вблизи|недалеко|неподалёку|'
+        r'неподалеку|неподалеку|' + re.escape(city) + r'$)',
+        re.IGNORECASE
+    )
+    if bad.match(addr.strip()):
         return ""
     return addr
 
@@ -84,55 +79,38 @@ def _groq(prompt: str) -> str:
     ).choices[0].message.content
 
 
-def _fmt(results: list) -> str:
-    return "\n".join(f"- {r['title']}: {r['content']}" for r in results)
-
-
 async def _get_photo(name: str, city: str, obj_type: str) -> str:
-    suffix = "здание фасад заброшка" if obj_type == "zabroshka" else "высотка здание крыша"
+    suffix = "здание фасад заброшка" if obj_type == "zabroshka" else "высотка крыша"
     try:
         r = await asyncio.to_thread(_tavily, f"{name} {city} {suffix}", True)
         imgs = r.get("images", [])
-        if imgs:
-            return imgs[0]
+        return imgs[0] if imgs else ""
     except Exception:
-        pass
-    return ""
-
-
-async def _search_source(query: str, source: str) -> list:
-    full_query = f"{query} {source}".strip()
-    try:
-        r = await asyncio.to_thread(_tavily, full_query)
-        results = r.get("results", [])
-        logger.info(f"Источник '{source or 'общий'}': {len(results)} результатов")
-        return results
-    except Exception:
-        return []
+        return ""
 
 
 def _build_prompt(obj_type: str, city: str, results: list, shown: set) -> str:
-    if obj_type == "roof":
-        task = f"Найди 3 точки для руфинга (крыша жилой/нежилой высотки) в {city}. {NO_LIST} Не аренда, не рестораны."
-    else:
-        task = f"Найди 3 заброшенных здания или объекта в {city}. {NO_LIST} Малоизвестные реальные места."
+    task = (
+        f"Найди 3 точки для руфинга (крыша жилой/нежилой высотки) в {city}. {NO_LIST} Не аренда, не рестораны."
+        if obj_type == "roof"
+        else f"Найди 3 заброшенных объекта в {city}. {NO_LIST} Малоизвестные реальные заброшки."
+    )
+    exclude = f"\n\nСТРОГО НЕ ПОВТОРЯТЬ:\n" + "\n".join(f"- {n}" for n in shown) if shown else ""
+    data = "\n".join(f"- {r['title']}: {r['content']}" for r in results)
 
-    exclude_block = ""
-    if shown:
-        names = "\n".join(f"- {n}" for n in shown)
-        exclude_block = f"\n\nСТРОГО НЕ ПОВТОРЯТЬ:\n{names}"
+    return f"""{task}{exclude}
 
-    return f"""{task}{exclude_block}
+Отвечай ТОЛЬКО на русском языке.
 
-Для каждого:
-- name: название здания/объекта
-- coords: координаты "55.7558, 37.6173" — ТОЛЬКО если есть в тексте. Не придумывай.
-- address: конкретная улица с номером дома или название района. НЕ писать "центр города", "у метро X", "у Москвы-Сити" и подобное. Только если нет coords и адрес конкретный.
-- description: состояние, атмосфера, особенности. Без ссылок и сайтов.
-- security: охрана, залаз — только если есть инфа
+Для каждого объекта:
+- name: название
+- coords: координаты "55.7558, 37.6173" — ТОЛЬКО если есть в тексте ниже
+- address: конкретная улица с номером или название района. Не писать просто название города.
+- description: состояние, атмосфера. Без ссылок.
+- security: охрана/залаз — только если есть инфа
 
 Данные:
-{_fmt(results)}
+{data}
 
 JSON массив:
 [{{"name":"...","coords":"...","address":"...","description":"...","security":"..."}}]
@@ -141,66 +119,70 @@ JSON массив:
 """
 
 
-async def search_objects(obj_type: str, city: str, shown: set) -> list:
-    base_query = f"{BASE_QUERIES[obj_type]} {city}"
+def _process_obj(obj: dict, results: list, idx: int, city: str) -> dict:
+    obj["published_date"] = results[idx].get("published_date", "") if idx < len(results) else ""
+    obj["description"] = _clean(obj.get("description", ""))
+    obj["security"] = _clean(obj.get("security", ""))
+    obj["address"] = _clean_address(obj.get("address", ""), city)
+    return obj
 
-    # Идём по иерархии источников
+
+async def search_objects(obj_type: str, city: str, shown: set) -> list:
+    base = f"{BASE_QUERIES[obj_type]} {city}"
+
     for source in SOURCES:
-        results = await _search_source(base_query, source)
+        query = f"{base} {source}".strip()
+        try:
+            results = (await asyncio.to_thread(_tavily, query)).get("results", [])
+        except Exception:
+            continue
+
+        logger.info(f"Источник '{source or 'общий'}': {len(results)} результатов")
         if not results:
             continue
 
-        prompt = _build_prompt(obj_type, city, results, shown)
         try:
-            text = await asyncio.to_thread(_groq, prompt)
-            logger.info(f"Groq ({source or 'общий'}): {text[:100]}")
+            text = await asyncio.to_thread(_groq, _build_prompt(obj_type, city, results, shown))
+            logger.info(f"Groq: {text[:100]}")
             objects = _parse_json(text)
         except Exception:
-            objects = []
+            continue
 
         if objects:
             for i, obj in enumerate(objects):
-                obj["published_date"] = results[i].get("published_date", "") if i < len(results) else ""
-                obj["description"] = _clean(obj.get("description", ""))
-                obj["security"] = _clean(obj.get("security", ""))
-                obj["address"] = _validate_address(obj.get("address", ""))
+                _process_obj(obj, results, i, city)
                 obj["image"] = await _get_photo(obj.get("name", ""), city, obj_type)
             return objects
 
-    # Если вообще всё пусто — возвращаем общий поиск без ограничений
-    logger.info("Все источники пусты — финальный поиск без shown")
-    results = await _search_source(base_query, "")
-    if not results:
-        return []
-
-    prompt = _build_prompt(obj_type, city, results, set())
+    # Финальный резерв — без ограничений по shown
     try:
-        text = await asyncio.to_thread(_groq, prompt)
+        results = (await asyncio.to_thread(_tavily, base)).get("results", [])
+        text = await asyncio.to_thread(_groq, _build_prompt(obj_type, city, results, set()))
         objects = _parse_json(text)
+        for i, obj in enumerate(objects):
+            _process_obj(obj, results, i, city)
+            obj["image"] = await _get_photo(obj.get("name", ""), city, obj_type)
+        return objects
     except Exception:
         return []
 
-    for i, obj in enumerate(objects):
-        obj["published_date"] = results[i].get("published_date", "") if i < len(results) else ""
-        obj["description"] = _clean(obj.get("description", ""))
-        obj["security"] = _clean(obj.get("security", ""))
-        obj["address"] = _validate_address(obj.get("address", ""))
-        obj["image"] = await _get_photo(obj.get("name", ""), city, obj_type)
-    return objects
-
 
 async def search_by_name(name: str, city: str) -> dict:
-    response = await asyncio.to_thread(_tavily, f"{name} {city} заброшка крыша", True)
-    results = response.get("results", [])
-    images = response.get("images", [])
+    try:
+        response = await asyncio.to_thread(_tavily, f"{name} {city} заброшка крыша", True)
+        results = response.get("results", [])
+        images = response.get("images", [])
+    except Exception:
+        return {"not_found": True}
 
     if not results:
         return {"not_found": True}
 
-    prompt = f"""Найди инфу об объекте "{name}" в {city}.
+    data = "\n".join(f"- {r['title']}: {r['content']}" for r in results)
+    prompt = f"""Найди инфу об объекте "{name}" в {city}. Отвечай только на русском.
 
 Данные:
-{_fmt(results)}
+{data}
 
 JSON:
 {{"name":"...","coords":"...","address":"...","description":"..."}}
@@ -213,6 +195,7 @@ JSON:
         result = _parse_json(text)
         if not result.get("not_found"):
             result["description"] = _clean(result.get("description", ""))
+            result["address"] = _clean_address(result.get("address", ""), city)
             result["image"] = images[0] if images else await _get_photo(name, city, "zabroshka")
         return result
     except Exception:

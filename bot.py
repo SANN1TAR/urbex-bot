@@ -1,13 +1,11 @@
-# Главный файл Telegram-бота по поиску заброшек и крыш
-# Интерфейс: по одному объекту, листается кнопками как тиндер
+# Telegram-бот по поиску заброшек и крыш. Интерфейс: тиндер — по одному объекту.
 
 import json
 import logging
 import os
-import re
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -18,7 +16,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 from database import get_user, init_db, save_user
-from search import search_by_name, search_objects
+from search import search_by_name, search_objects, _counters
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -88,10 +86,12 @@ def _format_obj(obj: dict) -> str:
         location = f"\n📍 {address}"
     else:
         location = "\n📍 место не помечено на карте"
+
     date = obj.get("published_date", "")
     date_line = f"\n📅 {date[:10]}" if date else ""
     security = obj.get("security", "")
     sec_line = f"\n🔒 {security}" if security and security.lower() != "неизвестно" else ""
+
     return (
         f"<b>{obj.get('name', 'Без названия')}</b>"
         f"{location}\n\n"
@@ -133,6 +133,15 @@ async def cmd_start(message: Message, state: FSMContext):
         await state.set_state(Reg.city)
 
 
+@dp.message(Command("restart"))
+async def cmd_restart(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    _shown_global.pop(uid, None)
+    _counters.clear()
+    await state.clear()
+    await message.answer("Перезагрузил. Всё с нуля — поехали.", reply_markup=MAIN_KB)
+
+
 @dp.message(Reg.city)
 async def reg_city(message: Message, state: FSMContext):
     if message.text in MENU_BUTTONS:
@@ -145,7 +154,7 @@ async def reg_city(message: Message, state: FSMContext):
     await message.answer(f"{city} — знаю там пару мест. Чё ищешь?", reply_markup=MAIN_KB)
 
 
-async def _send_one(message: Message, obj: dict, index: int, total: int):
+async def _send_one(message: Message, obj: dict):
     image = obj.get("image", "")
     if image:
         try:
@@ -158,6 +167,7 @@ async def _send_one(message: Message, obj: dict, index: int, total: int):
         disable_web_page_preview=True,
         reply_markup=NAV_KB,
     )
+    await message.answer(STALE_NOTE)
 
 
 async def start_browsing(message: Message, state: FSMContext, obj_type: str, city: str):
@@ -168,7 +178,7 @@ async def start_browsing(message: Message, state: FSMContext, obj_type: str, cit
     objects = await search_objects(obj_type, city, shown)
 
     if not objects:
-        await message.answer("Пусто. Либо нет инфы, либо всё снесли. Попробуй позже.")
+        await message.answer("Попробуй позже или смени город.", reply_markup=MAIN_KB)
         return
 
     new_names = {o.get("name", "") for o in objects}
@@ -182,9 +192,7 @@ async def start_browsing(message: Message, state: FSMContext, obj_type: str, cit
         cache=json.dumps([dict(o) for o in objects], ensure_ascii=False),
         idx=0,
     )
-
-    await _send_one(message, objects[0], 0, len(objects))
-    await message.answer(STALE_NOTE)
+    await _send_one(message, objects[0])
 
 
 @dp.callback_query(F.data == "next", Browsing.active)
@@ -196,38 +204,33 @@ async def handle_next(callback: CallbackQuery, state: FSMContext):
         pass
 
     data = await state.get_data()
-    obj_type = data["obj_type"]
-    city = data["city"]
     cache = json.loads(data["cache"])
     idx = data["idx"] + 1
 
     if idx < len(cache):
         await state.update_data(idx=idx)
-        await _send_one(callback.message, cache[idx], idx, len(cache))
-    else:
-        uid = callback.from_user.id
-        shown = _shown_global.get(uid, set())
-        await callback.message.answer("Ищу ещё... 🔍")
-        objects = await search_objects(obj_type, city, shown)
+        await _send_one(callback.message, cache[idx])
+        return
 
-        if not objects:
-            await callback.message.answer("Ищу в других источниках... 🔍")
-            objects = await search_objects(obj_type, city, set())
-            if not objects:
-                await callback.message.answer("Всё что нашёл — показал. Попробуй другой город.", reply_markup=MAIN_KB)
-                await state.clear()
-                return
+    uid = callback.from_user.id
+    shown = _shown_global.get(uid, set())
+    await callback.message.answer("Ищу ещё... 🔍")
+    objects = await search_objects(data["obj_type"], data["city"], shown)
 
-        new_names = {o.get("name", "") for o in objects}
-        combined = shown | new_names
-        _shown_global[uid] = combined if len(combined) <= 30 else new_names
+    if not objects:
+        await callback.message.answer("Попробуй позже или смени город.", reply_markup=MAIN_KB)
+        await state.clear()
+        return
 
-        await state.update_data(
-            cache=json.dumps([dict(o) for o in objects], ensure_ascii=False),
-            idx=0,
-        )
-        await _send_one(callback.message, objects[0], 0, len(objects))
-    await callback.message.answer(STALE_NOTE)
+    new_names = {o.get("name", "") for o in objects}
+    combined = shown | new_names
+    _shown_global[uid] = combined if len(combined) <= 30 else new_names
+
+    await state.update_data(
+        cache=json.dumps([dict(o) for o in objects], ensure_ascii=False),
+        idx=0,
+    )
+    await _send_one(callback.message, objects[0])
 
 
 @dp.callback_query(F.data == "restart", Browsing.active)
@@ -239,14 +242,10 @@ async def handle_restart(callback: CallbackQuery, state: FSMContext):
         pass
 
     data = await state.get_data()
-    obj_type = data["obj_type"]
-    city = data["city"]
     uid = callback.from_user.id
     _shown_global.pop(uid, None)
     await state.clear()
-
-    fake_msg = callback.message
-    await start_browsing(fake_msg, state, obj_type, city)
+    await start_browsing(callback.message, state, data["obj_type"], data["city"])
 
 
 async def _require_user(message: Message):
@@ -304,7 +303,7 @@ async def handle_search_query(message: Message, state: FSMContext):
 
     result = await search_by_name(query, user["city"])
     if not result or result.get("not_found"):
-        await message.answer(f"Хрен знает что за '{query}'. Не нашёл ничего.")
+        await message.answer(f"Не нашёл ничего по '{query}'.")
         return
 
     image = result.get("image", "")
@@ -313,7 +312,6 @@ async def handle_search_query(message: Message, state: FSMContext):
             await message.answer_photo(photo=image)
         except Exception:
             pass
-
     await message.answer(_format_obj(result), parse_mode="HTML", disable_web_page_preview=True)
 
 
