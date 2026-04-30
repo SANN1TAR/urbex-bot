@@ -1,4 +1,4 @@
-# Поиск объектов через Tavily + обработка результатов через Gemini
+# Поиск объектов через Tavily + обработка результатов через Groq
 # Получает: тип объекта (заброшка/крыша/бомбарь) и город
 # Отдаёт: список из 3 объектов с названием, адресом, описанием, источником
 
@@ -6,14 +6,13 @@ import asyncio
 import json
 import os
 
-import google.generativeai as genai
+from groq import Groq
 from tavily import TavilyClient
 from dotenv import load_dotenv
 
 load_dotenv()
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-2.0-flash")
+groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 SEARCH_QUERIES = {
@@ -47,8 +46,13 @@ def _tavily_search(query: str) -> dict:
     return tavily.search(query, max_results=6, include_images=True)
 
 
-def _gemini_ask(prompt: str) -> str:
-    return model.generate_content(prompt).text
+def _groq_ask(prompt: str) -> str:
+    completion = groq.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+    )
+    return completion.choices[0].message.content
 
 
 async def search_objects(obj_type: str, city: str) -> list:
@@ -73,7 +77,7 @@ async def search_objects(obj_type: str, city: str) -> list:
 Если объектов меньше 3 — дай сколько есть. Если нет совсем — верни [].
 """
 
-    text = await asyncio.to_thread(_gemini_ask, prompt)
+    text = await asyncio.to_thread(_groq_ask, prompt)
 
     try:
         objects = _parse_json(text)
@@ -106,7 +110,7 @@ async def search_by_name(name: str, city: str) -> dict:
 Если не найдено — верни: {{"not_found":true}}
 """
 
-    text = await asyncio.to_thread(_gemini_ask, prompt)
+    text = await asyncio.to_thread(_groq_ask, prompt)
 
     try:
         result = _parse_json(text)
