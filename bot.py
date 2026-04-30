@@ -1,7 +1,7 @@
 # Главный файл Telegram-бота по поиску заброшек и крыш
-# Получает: сообщения от пользователей в Telegram
-# Отдаёт: результаты поиска с координатами, описанием и фото
+# Интерфейс: по одному объекту, листается кнопками как тиндер
 
+import json
 import logging
 import os
 import re
@@ -26,7 +26,6 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
 dp = Dispatcher(storage=MemoryStorage())
 
-# Глобальная память показанных объектов до рестарта бота
 _shown_global: dict[int, set] = {}
 
 DISCLAIMER = (
@@ -43,12 +42,7 @@ VPN_NOTE = (
     "Если не открываются — врубай VPN."
 )
 
-STALE_NOTE = (
-    "⚡ Не серчай, но часть инфы может быть устаревшей — я за этим не слежу. "
-    "Перед вылазкой лучше перепроверь сам."
-)
-
-MENU_BUTTONS = {"🏚️ Заброшка", "🏗️ Крыша", "🔍 Поиск по названию", "🏙️ Сменить город"}
+STALE_NOTE = "⚡ Не серчай, инфа может быть устаревшей. Перед вылазкой перепроверь."
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
@@ -58,10 +52,13 @@ MAIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-MORE_KB = InlineKeyboardMarkup(inline_keyboard=[[
-    InlineKeyboardButton(text="🔥 Ещё 3", callback_data="more"),
-    InlineKeyboardButton(text="✅ Достаточно", callback_data="enough"),
+NAV_KB = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="➡️ Следующий", callback_data="next"),
+    InlineKeyboardButton(text="🔄 Заново", callback_data="restart"),
 ]])
+
+MENU_BUTTONS = {"🏚️ Заброшка", "🏗️ Крыша", "🔍 Поиск по названию", "🏙️ Сменить город"}
+OBJ_TYPE_NAMES = {"zabroshka": "заброшки", "roof": "крыши"}
 
 CITY_ALIASES = {
     "мск": "Москва", "москва": "Москва",
@@ -77,27 +74,21 @@ CITY_ALIASES = {
     "аст": "Астана", "астана": "Астана", "нур": "Астана",
 }
 
-OBJ_TYPE_NAMES = {"zabroshka": "заброшки", "roof": "крыши"}
-
 
 def _resolve_city(raw: str) -> str:
     return CITY_ALIASES.get(raw.lower().strip(), raw.strip().title())
 
 
-def _format_obj(num: int, obj: dict) -> str:
+def _format_obj(obj: dict) -> str:
     coords = obj.get("coords", "")
     address = obj.get("address", "")
     location = f"\n🗺 {coords}" if coords else (f"\n📍 {address}" if address else "")
-
     date = obj.get("published_date", "")
     date_line = f"\n📅 {date[:10]}" if date else ""
-
     security = obj.get("security", "")
     sec_line = f"\n🔒 {security}" if security and security.lower() != "неизвестно" else ""
-
-    prefix = f"{num}. " if num > 0 else ""
     return (
-        f"<b>{prefix}{obj.get('name', 'Без названия')}</b>"
+        f"<b>{obj.get('name', 'Без названия')}</b>"
         f"{location}\n\n"
         f"{obj.get('description', '')}"
         f"{sec_line}"
@@ -140,9 +131,7 @@ async def cmd_start(message: Message, state: FSMContext):
 @dp.message(Reg.city)
 async def reg_city(message: Message, state: FSMContext):
     if message.text in MENU_BUTTONS:
-        await state.clear()
         await message.answer("Сначала напиши город:", reply_markup=ReplyKeyboardRemove())
-        await state.set_state(Reg.city)
         return
     city = _resolve_city(message.text)
     await save_user(message.from_user.id, city)
@@ -151,18 +140,22 @@ async def reg_city(message: Message, state: FSMContext):
     await message.answer(f"{city} — знаю там пару мест. Чё ищешь?", reply_markup=MAIN_KB)
 
 
-async def _send_results(message: Message, objects: list):
-    for i, obj in enumerate(objects, 1):
-        image = obj.get("image", "")
-        if image:
-            try:
-                await message.answer_photo(photo=image)
-            except Exception:
-                pass
-        await message.answer(_format_obj(i, obj), parse_mode="HTML", disable_web_page_preview=True)
+async def _send_one(message: Message, obj: dict, index: int, total: int):
+    image = obj.get("image", "")
+    if image:
+        try:
+            await message.answer_photo(photo=image)
+        except Exception:
+            pass
+    await message.answer(
+        _format_obj(obj),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=NAV_KB,
+    )
 
 
-async def send_objects(message: Message, state: FSMContext, obj_type: str, city: str):
+async def start_browsing(message: Message, state: FSMContext, obj_type: str, city: str):
     uid = message.from_user.id
     shown = _shown_global.get(uid, set())
 
@@ -173,49 +166,82 @@ async def send_objects(message: Message, state: FSMContext, obj_type: str, city:
         await message.answer("Пусто. Либо нет инфы, либо всё снесли. Попробуй позже.")
         return
 
-    new_names = {obj.get("name", "") for obj in objects}
+    new_names = {o.get("name", "") for o in objects}
     combined = shown | new_names
-    # Сбрасываем если слишком много — чтобы не блокировать поиск
     _shown_global[uid] = combined if len(combined) <= 30 else new_names
 
-    await _send_results(message, objects)
-    await message.answer(STALE_NOTE)
     await state.set_state(Browsing.active)
-    await state.update_data(obj_type=obj_type, city=city)
-    await message.answer("Ещё поискать или хватит?", reply_markup=MORE_KB)
+    await state.update_data(
+        obj_type=obj_type,
+        city=city,
+        cache=json.dumps([dict(o) for o in objects], ensure_ascii=False),
+        idx=0,
+    )
+
+    await _send_one(message, objects[0], 0, len(objects))
+    await message.answer(STALE_NOTE)
 
 
-@dp.callback_query(F.data == "more", Browsing.active)
-async def handle_more(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "next", Browsing.active)
+async def handle_next(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.edit_reply_markup(reply_markup=None)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
     data = await state.get_data()
-    obj_type = data.get("obj_type")
-    city = data.get("city")
-    uid = callback.from_user.id
-    shown = _shown_global.get(uid, set())
+    obj_type = data["obj_type"]
+    city = data["city"]
+    cache = json.loads(data["cache"])
+    idx = data["idx"] + 1
 
-    await callback.message.answer(f"Ищу ещё {OBJ_TYPE_NAMES.get(obj_type)}... 🔍")
-    objects = await search_objects(obj_type, city, shown)
+    if idx < len(cache):
+        await state.update_data(idx=idx)
+        await _send_one(callback.message, cache[idx], idx, len(cache))
+    else:
+        uid = callback.from_user.id
+        shown = _shown_global.get(uid, set())
+        await callback.message.answer("Ищу ещё... 🔍")
+        objects = await search_objects(obj_type, city, shown)
 
-    if not objects:
-        await callback.message.answer("Больше ничего не нашёл, братан.")
-        await state.clear()
-        return
+        if not objects:
+            await callback.message.answer(
+                "Больше ничего нет, братан.",
+                reply_markup=MAIN_KB,
+            )
+            await state.clear()
+            return
 
-    _shown_global[uid] = shown | {obj.get("name", "") for obj in objects}
-    await _send_results(callback.message, objects)
+        new_names = {o.get("name", "") for o in objects}
+        combined = shown | new_names
+        _shown_global[uid] = combined if len(combined) <= 30 else new_names
+
+        await state.update_data(
+            cache=json.dumps([dict(o) for o in objects], ensure_ascii=False),
+            idx=0,
+        )
+        await _send_one(callback.message, objects[0], 0, len(objects))
     await callback.message.answer(STALE_NOTE)
-    await callback.message.answer("Ещё поискать или хватит?", reply_markup=MORE_KB)
 
 
-@dp.callback_query(F.data == "enough", Browsing.active)
-async def handle_enough(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "restart", Browsing.active)
+async def handle_restart(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.edit_reply_markup(reply_markup=None)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    data = await state.get_data()
+    obj_type = data["obj_type"]
+    city = data["city"]
+    uid = callback.from_user.id
+    _shown_global.pop(uid, None)
     await state.clear()
-    await callback.message.answer("Ок, завязали. Чё ещё надо?", reply_markup=MAIN_KB)
+
+    fake_msg = callback.message
+    await start_browsing(fake_msg, state, obj_type, city)
 
 
 async def _require_user(message: Message):
@@ -231,7 +257,7 @@ async def handle_zabroshka(message: Message, state: FSMContext):
     if not user:
         return
     await state.clear()
-    await send_objects(message, state, "zabroshka", user["city"])
+    await start_browsing(message, state, "zabroshka", user["city"])
 
 
 @dp.message(F.text == "🏗️ Крыша")
@@ -240,7 +266,7 @@ async def handle_roof(message: Message, state: FSMContext):
     if not user:
         return
     await state.clear()
-    await send_objects(message, state, "roof", user["city"])
+    await start_browsing(message, state, "roof", user["city"])
 
 
 @dp.message(F.text == "🏙️ Сменить город")
@@ -283,7 +309,7 @@ async def handle_search_query(message: Message, state: FSMContext):
         except Exception:
             pass
 
-    await message.answer(_format_obj(0, result), parse_mode="HTML", disable_web_page_preview=True)
+    await message.answer(_format_obj(result), parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def main():
