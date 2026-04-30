@@ -145,10 +145,14 @@ async def send_objects(message: Message, state: FSMContext, obj_type: str, city:
 async def _send_results(message: Message, objects: list):
     for i, obj in enumerate(objects, 1):
         date_note = _date_note(obj.get("published_date", ""))
+        security = obj.get("security", "")
+        security_line = f"\n🔒 Охрана: {security}" if security else ""
+
         await message.answer(
             f"<b>{i}. {obj.get('name', 'Без названия')}</b>\n"
             f"📍 {obj.get('address', 'адрес неизвестен')}\n\n"
             f"{obj.get('description', '')}"
+            f"{security_line}"
             f"{date_note}\n\n"
             f"🔗 {obj.get('source', '')}",
             parse_mode="HTML",
