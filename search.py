@@ -82,6 +82,38 @@ async def _wikimedia_image(query: str) -> str:
     return ""
 
 
+async def _flickr_image(query: str) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get("https://www.flickr.com/search/", params={
+                "text": query, "license": "2,3,4,5,6,9", "media": "photos",
+                "safe_search": "1", "view_all": "1",
+            }, headers={"User-Agent": "Mozilla/5.0"})
+            import re
+            urls = re.findall(r'https://live\.staticflickr\.com/[^"\']+\.jpg', r.text)
+            return urls[0] if urls else ""
+    except Exception:
+        return ""
+
+
+async def _get_image(name: str, obj_type: str, city: str) -> str:
+    fallback = "rooftop city view" if obj_type == "roof" else "abandoned building urbex"
+
+    # 1. Wikimedia с точным названием
+    url = await _wikimedia_image(f"{name} {city}")
+    if url:
+        return url
+
+    # 2. Wikimedia с общим запросом
+    url = await _wikimedia_image(fallback)
+    if url:
+        return url
+
+    # 3. Flickr
+    url = await _flickr_image(f"{name} {fallback}")
+    return url
+
+
 def _groq_ask(prompt: str) -> str:
     return groq.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -158,8 +190,7 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
             if i < len(results):
                 obj["published_date"] = results[i].get("published_date", "")
             name = obj.get("name", "")
-            img_suffix = "rooftop city skyline" if obj_type == "roof" else "abandoned urbex"
-            obj["image"] = await _wikimedia_image(f"{name} {img_suffix}")
+            obj["image"] = await _get_image(name, obj_type, city)
         return objects
     except Exception:
         return []
