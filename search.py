@@ -45,6 +45,9 @@ BANNED_WORDS = {
     "под снос", "снос", "реновация", "расселённый", "переселение",
     # Кинотеатры и культура (действующие)
     "кинотеатр", "театр", "филармония", "дворец культуры", "дк ",
+    # Несуществующие объекты (теги Викимапии)
+    "исторический слой", "исчезнувший", "невидимый объект", "historical",
+    "снесён", "снесено", "снесена", "не существует", "больше не существует",
 }
 
 
@@ -161,6 +164,19 @@ JSON массив (меньше 3 — дай сколько есть, ничег
 """
 
 
+def _dedup_coords(objects: list) -> list:
+    seen_coords = set()
+    for obj in objects:
+        coords = obj.get("coords", "").strip()
+        if not coords:
+            continue
+        if coords in seen_coords:
+            obj["coords"] = ""
+        else:
+            seen_coords.add(coords)
+    return objects
+
+
 def _process_obj(obj: dict, results: list, idx: int, city: str) -> dict:
     obj["published_date"] = results[idx].get("published_date", "") if idx < len(results) else ""
     obj["description"] = _clean(obj.get("description", ""))
@@ -196,7 +212,7 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
                 _process_obj(obj, results, i, city)
                 obj["source_name"] = source_name
                 obj["image"] = await _get_photo(obj.get("name", ""), city)
-            return objects
+            return _dedup_coords(objects)
 
     # Финальный резерв — без ограничений по shown
     try:
@@ -207,7 +223,7 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
             _process_obj(obj, results, i, city)
             obj["source_name"] = "интернет"
             obj["image"] = await _get_photo(obj.get("name", ""), city)
-        return objects
+        return _dedup_coords(objects)
     except Exception:
         return []
 
