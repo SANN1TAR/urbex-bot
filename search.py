@@ -126,7 +126,7 @@ def _tavily(query: str, images: bool = False) -> dict:
 def _groq(prompt: str) -> str:
     try:
         text = groq_client.chat.completions.create(
-            model="gemma2-9b-it",
+            model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
         ).choices[0].message.content
