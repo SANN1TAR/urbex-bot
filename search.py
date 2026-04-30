@@ -141,7 +141,8 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
             if i < len(results):
                 obj["published_date"] = results[i].get("published_date", "")
             name = obj.get("name", "")
-            obj["image"] = await _wikimedia_image(f"{name} abandoned urbex")
+            img_suffix = "rooftop city skyline" if obj_type == "roof" else "abandoned urbex"
+            obj["image"] = await _wikimedia_image(f"{name} {img_suffix}")
         return objects
     except Exception:
         return []
