@@ -102,16 +102,10 @@ async def reg_city(message: Message, state: FSMContext):
     )
 
 
-def _date_warning(pub_date: str) -> str:
+def _date_note(pub_date: str) -> str:
     if not pub_date:
         return ""
-    try:
-        year = int(pub_date[:4])
-        if year < 2022:
-            return f"\n⚠️ Инфа от {year} года — перепроверь актуальность, могло всё измениться."
-        return f"\n📅 Опубликовано: {pub_date[:10]}"
-    except Exception:
-        return ""
+    return f"\n📅 Опубликовано: {pub_date[:10]}"
 
 
 async def send_objects(message: Message, state: FSMContext, obj_type: str, city: str):
@@ -140,7 +134,7 @@ async def _send_results(message: Message, objects: list):
             except Exception:
                 pass
 
-        date_note = _date_warning(obj.get("published_date", ""))
+        date_note = _date_note(obj.get("published_date", ""))
 
         await message.answer(
             f"<b>{i}. {obj.get('name', 'Без названия')}</b>\n"
@@ -242,7 +236,7 @@ async def handle_search_query(message: Message, state: FSMContext):
         except Exception:
             pass
 
-    date_note = _date_warning(result.get("published_date", ""))
+    date_note = _date_note(result.get("published_date", ""))
 
     await message.answer(
         f"<b>{result.get('name', query)}</b>\n"
