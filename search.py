@@ -9,6 +9,7 @@ import os
 import re
 
 import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from tavily import TavilyClient
 from dotenv import load_dotenv
 
@@ -16,7 +17,15 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-_gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+_gemini_model = genai.GenerativeModel(
+    "gemini-2.0-flash",
+    safety_settings={
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+    },
+)
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 NO_LIST = "Нельзя: МГУ, Кремль, телебашни, Москва-Сити, ВДНХ, Останкино, госучреждения."
@@ -114,7 +123,14 @@ def _tavily(query: str, images: bool = False) -> dict:
 
 
 def _gemini(prompt: str) -> str:
-    return _gemini_model.generate_content(prompt).text
+    try:
+        response = _gemini_model.generate_content(prompt)
+        text = response.text
+        logger.info(f"Gemini ответил: {text[:80]}")
+        return text
+    except Exception as e:
+        logger.error(f"Gemini упал: {e}")
+        raise
 
 
 async def _get_photo(name: str, city: str) -> str:
