@@ -1,0 +1,4 @@
+.env
+urbex_bot.db
+__pycache__/
+*.pyc
