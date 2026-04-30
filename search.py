@@ -42,21 +42,37 @@ def _format_results(results: list) -> str:
     return "\n".join(f"- {r['title']}: {r['content']} (URL: {r['url']})" for r in results)
 
 
+QUERY_VARIANTS = {
+    "zabroshka": ["заброшенное здание урбекс", "заброшка адрес где находится", "urbex заброшенный объект"],
+    "roof": ["руфинг крышелазание высотка", "крыша залезть город", "руф точка высотное здание"],
+    "digger": ["бомбоубежище дигеры подземелье", "подземный бункер катакомбы", "бомбарь вход город"],
+}
+
+_query_counters: dict = {}
+
+
 def _tavily_search(query: str) -> dict:
-    return tavily.search(query, max_results=6, include_images=True)
+    return tavily.search(query, max_results=10, include_images=True)
 
 
 def _groq_ask(prompt: str) -> str:
     completion = groq.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
+        temperature=0.7,
     )
     return completion.choices[0].message.content
 
 
-async def search_objects(obj_type: str, city: str) -> list:
-    query = f"{SEARCH_QUERIES[obj_type]} {city}"
+async def search_objects(obj_type: str, city: str, shown: list | None = None) -> list:
+    shown = shown or []
+
+    counter = _query_counters.get(f"{obj_type}_{city}", 0)
+    variants = QUERY_VARIANTS[obj_type]
+    query_base = variants[counter % len(variants)]
+    _query_counters[f"{obj_type}_{city}"] = counter + 1
+
+    query = f"{query_base} {city}"
     response = await asyncio.to_thread(_tavily_search, query)
 
     results = response.get("results", [])
@@ -65,8 +81,10 @@ async def search_objects(obj_type: str, city: str) -> list:
     if not results:
         return []
 
-    prompt = f"""Из результатов поиска выдели 3 реальных объекта типа "{TYPE_NAMES[obj_type]}" в городе {city}.
-Для каждого дай: name, address (адрес или район), description (2-3 предложения), source (URL).
+    exclude = f"Уже показанные объекты (не повторяй их): {', '.join(shown)}.\n" if shown else ""
+
+    prompt = f"""Из результатов поиска выдели 3 реальных РАЗНЫХ объекта типа "{TYPE_NAMES[obj_type]}" в городе {city}.
+{exclude}Для каждого дай: name, address (адрес или район), description (2-3 предложения), source (URL).
 
 Результаты:
 {_format_results(results)}

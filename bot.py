@@ -118,10 +118,11 @@ async def send_objects(message: Message, state: FSMContext, obj_type: str, city:
         await message.answer("Пусто. Либо нет инфы, либо всё снесли. Попробуй позже.")
         return
 
+    shown = [obj.get("name", "") for obj in objects]
     await _send_results(message, objects)
 
     await state.set_state(Browsing.active)
-    await state.update_data(obj_type=obj_type, city=city)
+    await state.update_data(obj_type=obj_type, city=city, shown=shown)
     await message.answer("Ещё поискать или хватит?", reply_markup=MORE_KB)
 
 
@@ -157,15 +158,18 @@ async def handle_more(callback: CallbackQuery, state: FSMContext):
     city = data.get("city")
     type_name = OBJ_TYPE_NAMES.get(obj_type, "объекты")
 
+    shown = data.get("shown", [])
     await callback.message.answer(f"Ищу ещё {type_name}... 🔍")
-    objects = await search_objects(obj_type, city)
+    objects = await search_objects(obj_type, city, shown=shown)
 
     if not objects:
         await callback.message.answer("Больше ничего не нашёл, братан.")
         await state.clear()
         return
 
+    shown += [obj.get("name", "") for obj in objects]
     await _send_results(callback.message, objects)
+    await state.update_data(shown=shown)
     await callback.message.answer("Ещё поискать или хватит?", reply_markup=MORE_KB)
 
 
