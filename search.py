@@ -1,6 +1,6 @@
 # Поиск объектов через Tavily + обработка результатов через Groq
 # Получает: тип объекта (zabroshka/roof) и город
-# Отдаёт: список из 3 объектов с названием, адресом, описанием, источником
+# Отдаёт: список из 3 объектов с названием, адресом, описанием, фото
 
 import asyncio
 import json
@@ -24,9 +24,9 @@ TYPE_NAMES = {
 
 QUERY_VARIANTS = {
     "zabroshka": [
-        "заброшка адрес как попасть охрана",
-        "заброшенное здание точный адрес улица",
-        "urbex заброшка координаты вход",
+        "заброшка адрес как попасть охрана wikimapia",
+        "заброшенное здание точный адрес улица wikimapia",
+        "urbex заброшка координаты вход wikimapia",
     ],
     "roof": [
         "крыша руф адрес как залезть охрана",
@@ -53,7 +53,7 @@ def _format_results(results: list) -> str:
 
 
 def _tavily_search(query: str) -> dict:
-    return tavily.search(query, max_results=10)
+    return tavily.search(query, max_results=10, include_images=True)
 
 
 def _groq_ask(prompt: str) -> str:
@@ -62,6 +62,15 @@ def _groq_ask(prompt: str) -> str:
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
     ).choices[0].message.content
+
+
+def _sort_results(results: list) -> list:
+    def key(r):
+        url = r.get("url", "")
+        priority = 0 if ("vk.com" in url or "t.me" in url or "telegram" in url) else 1
+        date = r.get("published_date") or ""
+        return (priority, date)
+    return sorted(results, key=key)
 
 
 async def search_objects(obj_type: str, city: str, shown: list | None = None) -> list:
@@ -73,19 +82,11 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
     _query_counters[key] = counter + 1
 
     response = await asyncio.to_thread(_tavily_search, f"{query_base} {city}")
-    results = response.get("results", [])
+    results = _sort_results(response.get("results", []))
+    images = response.get("images", [])
 
     if not results:
         return []
-
-    # Сортировка: VK и Telegram первыми, потом свежие
-    def _sort_key(r):
-        url = r.get("url", "")
-        priority = 0 if ("vk.com" in url or "t.me" in url or "telegram" in url) else 1
-        date = r.get("published_date") or ""
-        return (priority, f"{date}" if date else "")
-
-    results.sort(key=_sort_key)
 
     exclude = f"Уже показанные объекты (не повторяй их): {', '.join(shown)}.\n" if shown else ""
 
@@ -96,15 +97,14 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
 - address: ТОЧНЫЙ адрес — улица, номер дома. Если нет точного — район и ориентир
 - description: что это за место, какой вид/атмосфера, особенности
 - security: охрана, замки, камеры, сложность попадания. Если инфы нет — не включай поле
-- source: URL откуда взята инфа
 
 Результаты:
 {_format_results(results)}
 
+Приоритет источников: сначала ВКонтакте (vk.com) и Telegram (t.me), потом остальные.
 Ответь строго JSON массивом без лишнего текста:
-[{{"name":"...","address":"...","description":"...","security":"...","source":"..."}}]
+[{{"name":"...","address":"...","description":"...","security":"..."}}]
 
-Приоритет источников: сначала посты из ВКонтакте (vk.com) и Telegram (t.me), потом остальные.
 Нужны конкретные точки с адресами, не общие статьи. Если объектов меньше 3 — дай сколько есть. Если нет — верни [].
 """
 
@@ -115,14 +115,17 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
         for i, obj in enumerate(objects):
             if i < len(results):
                 obj["published_date"] = results[i].get("published_date", "")
+            if i < len(images):
+                obj["image"] = images[i]
         return objects
     except Exception:
         return []
 
 
 async def search_by_name(name: str, city: str) -> dict:
-    response = await asyncio.to_thread(_tavily_search, f"{name} {city} заброшка крыша")
-    results = response.get("results", [])
+    response = await asyncio.to_thread(_tavily_search, f"{name} {city} заброшка крыша wikimapia")
+    results = _sort_results(response.get("results", []))
+    images = response.get("images", [])
 
     if not results:
         return {"not_found": True}
@@ -133,7 +136,7 @@ async def search_by_name(name: str, city: str) -> dict:
 {_format_results(results)}
 
 Ответь строго JSON без лишнего текста:
-{{"name":"...","address":"...","description":"...","source":"..."}}
+{{"name":"...","address":"...","description":"..."}}
 
 Если не найдено — верни: {{"not_found":true}}
 """
@@ -141,6 +144,9 @@ async def search_by_name(name: str, city: str) -> dict:
     text = await asyncio.to_thread(_groq_ask, prompt)
 
     try:
-        return _parse_json(text)
+        result = _parse_json(text)
+        if images and not result.get("not_found"):
+            result["image"] = images[0]
+        return result
     except Exception:
         return {"not_found": True}

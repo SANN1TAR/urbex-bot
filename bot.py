@@ -90,13 +90,13 @@ def _format_obj(num: int, obj: dict) -> str:
     security = obj.get("security", "")
     sec_line = f"\n🔒 Охрана: {security}" if security and security.lower() != "неизвестно" else ""
 
+    prefix = f"{num}. " if num > 0 else ""
     return (
-        f"<b>{num}. {obj.get('name', 'Без названия')}</b>\n"
+        f"<b>{prefix}{obj.get('name', 'Без названия')}</b>\n"
         f"📍 {obj.get('address', 'адрес неизвестен')}\n\n"
         f"{obj.get('description', '')}"
         f"{sec_line}"
-        f"{date_line}\n\n"
-        f"🔗 {obj.get('source', '')}"
+        f"{date_line}"
     )
 
 
@@ -143,6 +143,12 @@ async def reg_city(message: Message, state: FSMContext):
 
 async def _send_results(message: Message, objects: list):
     for i, obj in enumerate(objects, 1):
+        image = obj.get("image", "")
+        if image:
+            try:
+                await message.answer_photo(photo=image)
+            except Exception:
+                pass
         await message.answer(_format_obj(i, obj), parse_mode="HTML", disable_web_page_preview=True)
 
 
