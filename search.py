@@ -78,6 +78,9 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
     if not results:
         return []
 
+    # Сортировка: свежие результаты первыми
+    results.sort(key=lambda r: r.get("published_date") or "", reverse=True)
+
     exclude = f"Уже показанные объекты (не повторяй их): {', '.join(shown)}.\n" if shown else ""
 
     prompt = f"""Из результатов поиска выдели 3 реальных РАЗНЫХ конкретных объекта типа "{TYPE_NAMES[obj_type]}" в городе {city}.
