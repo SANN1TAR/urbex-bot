@@ -1,5 +1,5 @@
-# Работа с базой данных: хранит пользователей (telegram_id, имя, город)
-# Получает: telegram_id, имя, город
+# Работа с базой данных: хранит пользователей (telegram_id, город)
+# Получает: telegram_id, город
 # Отдаёт: данные пользователя или None
 
 import aiosqlite
@@ -12,7 +12,6 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
                 city TEXT NOT NULL,
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -23,19 +22,19 @@ async def init_db():
 async def get_user(telegram_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT telegram_id, name, city FROM users WHERE telegram_id = ?",
+            "SELECT telegram_id, city FROM users WHERE telegram_id = ?",
             (telegram_id,)
         ) as cursor:
             row = await cursor.fetchone()
             if row:
-                return {"telegram_id": row[0], "name": row[1], "city": row[2]}
+                return {"telegram_id": row[0], "city": row[1]}
             return None
 
 
-async def save_user(telegram_id: int, name: str, city: str):
+async def save_user(telegram_id: int, city: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO users (telegram_id, name, city) VALUES (?, ?, ?)",
-            (telegram_id, name, city)
+            "INSERT OR REPLACE INTO users (telegram_id, city) VALUES (?, ?)",
+            (telegram_id, city)
         )
         await db.commit()

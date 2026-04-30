@@ -60,14 +60,32 @@ MORE_KB = InlineKeyboardMarkup(inline_keyboard=[
     ]
 ])
 
+CITY_ALIASES = {
+    "мск": "Москва", "москва": "Москва",
+    "спб": "Санкт-Петербург", "спт": "Санкт-Петербург", "питер": "Санкт-Петербург",
+    "екб": "Екатеринбург", "екат": "Екатеринбург",
+    "нск": "Новосибирск", "новосиб": "Новосибирск",
+    "ннов": "Нижний Новгород", "нн": "Нижний Новгород",
+    "крд": "Краснодар", "казань": "Казань",
+    "чел": "Челябинск", "уфа": "Уфа",
+    "омск": "Омск", "самара": "Самара",
+    "рнд": "Ростов-на-Дону", "ростов": "Ростов-на-Дону",
+    "вгд": "Волгоград", "пермь": "Пермь",
+    "алм": "Алматы", "алматы": "Алматы", "алма-ата": "Алматы",
+    "аст": "Астана", "астана": "Астана", "нур": "Астана",
+}
+
 OBJ_TYPE_NAMES = {
     "zabroshka": "заброшки",
     "roof": "крыши",
 }
 
 
+def _resolve_city(raw: str) -> str:
+    return CITY_ALIASES.get(raw.lower().strip(), raw.strip().title())
+
+
 class Reg(StatesGroup):
-    name = State()
     city = State()
 
 
@@ -85,7 +103,7 @@ async def cmd_start(message: Message, state: FSMContext):
     user = await get_user(message.from_user.id)
     if user:
         await message.answer(
-            f"О, {user['name']}, вернулся. Город {user['city']} — поехали, чё надо?",
+            f"О, вернулся. Город {user['city']} — поехали, чё надо?",
             reply_markup=MAIN_KB,
         )
     else:
@@ -93,24 +111,16 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(
             "Здорово, ёпта. Я тут из рода экскурсоводов — знаю почти все дыры в городе.\n\n"
             "Может, тебе понадобятся крыши. Может, заброшки.\n\n"
-            "Ты скажи как тебя кличут, а я пока подыщу что тебе понадобится.",
+            "Из какого ты города? Пиши как угодно — МСК, ЕКБ, Питер, полное название.",
             reply_markup=ReplyKeyboardRemove(),
         )
-        await state.set_state(Reg.name)
-
-
-@dp.message(Reg.name)
-async def reg_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text.strip())
-    await message.answer(f"Нормально, {message.text.strip()}. В каком городе шаришься?")
-    await state.set_state(Reg.city)
+        await state.set_state(Reg.city)
 
 
 @dp.message(Reg.city)
 async def reg_city(message: Message, state: FSMContext):
-    data = await state.get_data()
-    city = message.text.strip()
-    await save_user(message.from_user.id, data["name"], city)
+    city = _resolve_city(message.text)
+    await save_user(message.from_user.id, city)
     await state.clear()
     await message.answer(VPN_NOTE, parse_mode="HTML")
     await message.answer(
