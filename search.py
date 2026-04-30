@@ -106,17 +106,35 @@ def _clean(text: str) -> str:
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 
+_FAKE_ADDR = re.compile(
+    r'исходя|вероятно|возможно|предположительно|по всей видимости|'
+    r'без указания|не указан|неизвестно|unknown|н/д|n/a',
+    re.IGNORECASE
+)
+
 def _clean_address(addr: str, city: str) -> str:
     if not addr:
         return ""
+    if _FAKE_ADDR.search(addr):
+        return ""
     bad = re.compile(
         r'^(центр\s+\w+|у\s+\w+|рядом|около|вблизи|недалеко|неподалёку|'
-        r'неподалеку|неподалеку|' + re.escape(city) + r'$)',
+        r'неподалеку|' + re.escape(city) + r'$)',
         re.IGNORECASE
     )
     if bad.match(addr.strip()):
         return ""
     return addr
+
+
+def _clean_description(text: str) -> str:
+    if not text:
+        return ""
+    text = _clean(text)
+    # убираем мусорные фразы про "неизвестное время"
+    text = re.sub(r'[,.]?\s*[а-яё]+\s+в\s+неизвестн\w+\s+время\.?', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'[,.]?\s*заброшен\w*\s+в\s+неизвестн\w+\s+время\.?', '', text, flags=re.IGNORECASE)
+    return re.sub(r'\s{2,}', ' ', text).strip()
 
 
 def _tavily(query: str, images: bool = False) -> dict:
@@ -156,7 +174,7 @@ def _build_prompt(obj_type: str, city: str, results: list, shown: set) -> str:
 СТРОГИЕ ПРАВИЛА — нарушение недопустимо:
 1. Только реально заброшенные объекты — не действующие заводы, жилые дома, госучреждения, торговые центры, парки.
 2. coords — ТОЛЬКО если координаты прямо написаны в данных ниже. Не угадывать, не вычислять, не придумывать. Если нет — пустая строка "".
-3. address — только конкретная улица с номером или район. Если нет точного адреса — пустая строка "". Не писать просто название города.
+3. address — ТОЛЬКО если адрес прямо написан в данных ниже. Не угадывать, не писать "вероятно", "исходя из описания", "без указания". Если нет — пустая строка "".
 4. Отвечай ТОЛЬКО на русском языке.
 5. Возвращай ТОЛЬКО JSON, без пояснений.
 
@@ -183,10 +201,28 @@ def _dedup_coords(objects: list) -> list:
 
 def _process_obj(obj: dict, results: list, idx: int, city: str) -> dict:
     obj["published_date"] = results[idx].get("published_date", "") if idx < len(results) else ""
-    obj["description"] = _clean(obj.get("description", ""))
+    obj["description"] = _clean_description(obj.get("description", ""))
     obj["security"] = _clean(obj.get("security", ""))
     obj["address"] = _clean_address(obj.get("address", ""), city)
     return obj
+
+
+def _dedup_objects(objects: list) -> list:
+    seen_names = set()
+    seen_addrs = set()
+    result = []
+    for obj in objects:
+        norm_name = _normalize_name(obj.get("name", ""))
+        addr = obj.get("address", "").strip().lower()
+        if norm_name in seen_names:
+            continue
+        if addr and addr in seen_addrs:
+            continue
+        seen_names.add(norm_name)
+        if addr:
+            seen_addrs.add(addr)
+        result.append(obj)
+    return result
 
 
 async def search_objects(obj_type: str, city: str, shown: set) -> list:
@@ -233,7 +269,7 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
         obj["source_name"] = all_results[i].get("_source", "интернет") if i < len(all_results) else "интернет"
         obj["image"] = await _get_photo(obj.get("name", ""), city)
 
-    return _dedup_coords(objects)
+    return _dedup_coords(_dedup_objects(objects))
 
 
 async def search_by_name(name: str, city: str) -> dict:
