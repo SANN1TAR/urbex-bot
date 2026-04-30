@@ -206,12 +206,12 @@ async def handle_next(callback: CallbackQuery, state: FSMContext):
         objects = await search_objects(obj_type, city, shown)
 
         if not objects:
-            await callback.message.answer(
-                "Больше ничего нет, братан.",
-                reply_markup=MAIN_KB,
-            )
-            await state.clear()
-            return
+            await callback.message.answer("Ищу в других источниках... 🔍")
+            objects = await search_objects(obj_type, city, set())
+            if not objects:
+                await callback.message.answer("Всё что нашёл — показал. Попробуй другой город.", reply_markup=MAIN_KB)
+                await state.clear()
+                return
 
         new_names = {o.get("name", "") for o in objects}
         combined = shown | new_names
