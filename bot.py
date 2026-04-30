@@ -82,7 +82,12 @@ def _resolve_city(raw: str) -> str:
 def _format_obj(obj: dict) -> str:
     coords = obj.get("coords", "")
     address = obj.get("address", "")
-    location = f"\n🗺 {coords}" if coords else (f"\n📍 {address}" if address else "")
+    if coords:
+        location = f"\n🗺 {coords}"
+    elif address:
+        location = f"\n📍 {address}"
+    else:
+        location = "\n📍 место не помечено на карте"
     date = obj.get("published_date", "")
     date_line = f"\n📅 {date[:10]}" if date else ""
     security = obj.get("security", "")
