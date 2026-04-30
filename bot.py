@@ -20,7 +20,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 from database import get_user, init_db, save_user
-from search import search_by_name, search_images, search_objects
+from search import search_by_name, search_objects
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -99,18 +99,16 @@ async def send_objects(message: Message, obj_type: str, type_name: str, city: st
         address = obj.get("address", "адрес неизвестен")
         description = obj.get("description", "")
         source = obj.get("source", "")
+        image = obj.get("image", "")
 
-        photos = await search_images(name, city)
-
-        if photos:
-            for photo in photos[:2]:
-                try:
-                    await message.answer_photo(
-                        photo=photo["url"],
-                        caption=f"📸 Источник фото: {photo['source']}",
-                    )
-                except Exception:
-                    pass
+        if image:
+            try:
+                await message.answer_photo(
+                    photo=image,
+                    caption=f"📸 Фото из поиска",
+                )
+            except Exception:
+                pass
 
         text = (
             f"<b>{i}. {name}</b>\n"
@@ -173,17 +171,16 @@ async def process_search_by_name(message: Message, state: FSMContext):
         return
 
     name = result.get("name", query)
-    photos = await search_images(name, user["city"])
+    images = result.get("images", [])
 
-    if photos:
-        for photo in photos[:2]:
-            try:
-                await message.answer_photo(
-                    photo=photo["url"],
-                    caption=f"📸 Источник фото: {photo['source']}",
-                )
-            except Exception:
-                pass
+    for img_url in images[:2]:
+        try:
+            await message.answer_photo(
+                photo=img_url,
+                caption="📸 Фото из поиска",
+            )
+        except Exception:
+            pass
 
     text = (
         f"<b>{name}</b>\n"
