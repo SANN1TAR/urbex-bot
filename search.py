@@ -7,9 +7,9 @@ import json
 import logging
 import os
 
+import httpx
 from groq import Groq
 from tavily import TavilyClient
-from duckduckgo_search import DDGS
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -57,13 +57,29 @@ def _tavily_search(query: str) -> dict:
     return tavily.search(query, max_results=10)
 
 
-def _ddg_image(query: str) -> str:
+async def _wikimedia_image(query: str) -> str:
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.images(query, max_results=1))
-            return results[0]["image"] if results else ""
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get("https://commons.wikimedia.org/w/api.php", params={
+                "action": "query", "list": "search", "srsearch": query,
+                "srnamespace": "6", "format": "json", "srlimit": 3,
+            })
+            hits = r.json().get("query", {}).get("search", [])
+            if not hits:
+                return ""
+            title = hits[0]["title"]
+            r2 = await client.get("https://commons.wikimedia.org/w/api.php", params={
+                "action": "query", "titles": title, "prop": "imageinfo",
+                "iiprop": "url", "format": "json",
+            })
+            pages = r2.json().get("query", {}).get("pages", {})
+            for page in pages.values():
+                info = page.get("imageinfo", [])
+                if info:
+                    return info[0].get("url", "")
     except Exception:
-        return ""
+        pass
+    return ""
 
 
 def _groq_ask(prompt: str) -> str:
@@ -125,7 +141,7 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
             if i < len(results):
                 obj["published_date"] = results[i].get("published_date", "")
             name = obj.get("name", "")
-            obj["image"] = await asyncio.to_thread(_ddg_image, f"{name} {city} заброшка фото")
+            obj["image"] = await _wikimedia_image(f"{name} abandoned urbex")
         return objects
     except Exception:
         return []
