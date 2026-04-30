@@ -67,7 +67,7 @@ def _groq_ask(prompt: str) -> str:
 def _sort_results(results: list) -> list:
     def key(r):
         url = r.get("url", "")
-        priority = 0 if ("vk.com" in url or "t.me" in url or "telegram" in url) else 1
+        priority = 0 if "wikimapia" in url else 1
         date = r.get("published_date") or ""
         return (priority, date)
     return sorted(results, key=key)
@@ -101,7 +101,6 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
 Результаты:
 {_format_results(results)}
 
-Приоритет источников: сначала ВКонтакте (vk.com) и Telegram (t.me), потом остальные.
 Ответь строго JSON массивом без лишнего текста:
 [{{"name":"...","address":"...","description":"...","security":"..."}}]
 
