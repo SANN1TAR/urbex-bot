@@ -4,11 +4,14 @@
 
 import asyncio
 import json
+import logging
 import os
 
 from groq import Groq
 from tavily import TavilyClient
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -77,6 +80,7 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
 
     results = response.get("results", [])
     images = response.get("images", [])
+    logger.info(f"Tavily вернул {len(results)} результатов и {len(images)} фото: {images[:3]}")
 
     if not results:
         return []
