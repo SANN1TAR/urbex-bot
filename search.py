@@ -20,6 +20,18 @@ tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 NO_LIST = "Нельзя: МГУ, Кремль, телебашни, Москва-Сити, ВДНХ, Останкино, госучреждения."
 
+BANNED_WORDS = {
+    "москва-сити", "moscow city", "москва сити", "останкино", "останкинская",
+    "кремль", "мгу", "вднх", "лужники", "газпром", "сити", "федерация",
+    "эволюция", "империя", "меркурий", "нафта", "око", "башня 2000",
+    "большой театр", "гум", "цум", "фсб", "фсо", "минобороны",
+}
+
+
+def _is_banned(obj: dict) -> bool:
+    text = (obj.get("name", "") + " " + obj.get("description", "")).lower()
+    return any(word in text for word in BANNED_WORDS)
+
 SOURCES = [
     "site:wikimapia.org",
     "site:urbantrip.ru",
@@ -148,6 +160,7 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
         except Exception:
             continue
 
+        objects = [o for o in objects if not _is_banned(o)]
         if objects:
             for i, obj in enumerate(objects):
                 _process_obj(obj, results, i, city)
@@ -158,7 +171,7 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
     try:
         results = (await asyncio.to_thread(_tavily, base)).get("results", [])
         text = await asyncio.to_thread(_groq, _build_prompt(obj_type, city, results, set()))
-        objects = _parse_json(text)
+        objects = [o for o in _parse_json(text) if not _is_banned(o)]
         for i, obj in enumerate(objects):
             _process_obj(obj, results, i, city)
             obj["image"] = await _get_photo(obj.get("name", ""), city, obj_type)
