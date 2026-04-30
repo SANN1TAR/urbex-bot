@@ -8,24 +8,14 @@ import logging
 import os
 import re
 
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from groq import Groq
 from tavily import TavilyClient
 from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-_gemini_model = genai.GenerativeModel(
-    "gemini-1.5-flash-latest",
-    safety_settings={
-        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-    },
-)
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 NO_LIST = "Нельзя: МГУ, Кремль, телебашни, Москва-Сити, ВДНХ, Останкино, госучреждения."
@@ -122,14 +112,17 @@ def _tavily(query: str, images: bool = False) -> dict:
     return tavily_client.search(query, max_results=8, include_images=images)
 
 
-def _gemini(prompt: str) -> str:
+def _groq(prompt: str) -> str:
     try:
-        response = _gemini_model.generate_content(prompt)
-        text = response.text
-        logger.info(f"Gemini ответил: {text[:80]}")
+        text = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+        ).choices[0].message.content
+        logger.info(f"Groq ответил: {text[:80]}")
         return text
     except Exception as e:
-        logger.error(f"Gemini упал: {e}")
+        logger.error(f"Groq упал: {e}")
         raise
 
 
@@ -187,8 +180,8 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
             continue
 
         try:
-            text = await asyncio.to_thread(_gemini, _build_prompt(obj_type, city, results, shown))
-            logger.info(f"Gemini: {text[:100]}")
+            text = await asyncio.to_thread(_groq, _build_prompt(obj_type, city, results, shown))
+            logger.info(f"Groq: {text[:100]}")
             objects = _parse_json(text)
         except Exception:
             continue
@@ -204,7 +197,7 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
     # Финальный резерв — без ограничений по shown
     try:
         results = (await asyncio.to_thread(_tavily, base)).get("results", [])
-        text = await asyncio.to_thread(_gemini, _build_prompt(obj_type, city, results, set()))
+        text = await asyncio.to_thread(_groq, _build_prompt(obj_type, city, results, set()))
         objects = [o for o in _parse_json(text) if not _is_banned(o)]
         for i, obj in enumerate(objects):
             _process_obj(obj, results, i, city)
@@ -239,7 +232,7 @@ JSON:
 """
 
     try:
-        text = await asyncio.to_thread(_gemini, prompt)
+        text = await asyncio.to_thread(_groq, prompt)
         result = _parse_json(text)
         if not result.get("not_found"):
             result["description"] = _clean(result.get("description", ""))
