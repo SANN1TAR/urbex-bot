@@ -85,7 +85,7 @@ def _format_obj(obj: dict) -> str:
     elif address:
         location = f"\n📍 {address}"
     else:
-        location = "\n📍 место не помечено на карте"
+        location = ""
 
     date = obj.get("published_date", "")
     date_line = f"\n📅 {date[:10]}" if date else ""
