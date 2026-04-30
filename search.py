@@ -24,14 +24,14 @@ TYPE_NAMES = {
 
 QUERY_VARIANTS = {
     "zabroshka": [
-        "заброшка адрес vk.com telegram",
-        "заброшенное здание адрес вконтакте телеграм",
-        "urbex заброшка координаты вход site:vk.com",
+        "заброшка адрес как попасть охрана",
+        "заброшенное здание точный адрес улица",
+        "urbex заброшка координаты вход",
     ],
     "roof": [
-        "крыша руф адрес vk.com telegram",
-        "руфинг точка адрес высотка вконтакте телеграм",
-        "крышелазание здание адрес site:vk.com",
+        "крыша руф адрес как залезть охрана",
+        "руфинг точка адрес высотка вид",
+        "крышелазание здание улица как попасть",
     ],
 }
 
@@ -78,8 +78,14 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
     if not results:
         return []
 
-    # Сортировка: свежие результаты первыми
-    results.sort(key=lambda r: r.get("published_date") or "", reverse=True)
+    # Сортировка: VK и Telegram первыми, потом свежие
+    def _sort_key(r):
+        url = r.get("url", "")
+        priority = 0 if ("vk.com" in url or "t.me" in url or "telegram" in url) else 1
+        date = r.get("published_date") or ""
+        return (priority, f"{date}" if date else "")
+
+    results.sort(key=_sort_key)
 
     exclude = f"Уже показанные объекты (не повторяй их): {', '.join(shown)}.\n" if shown else ""
 
