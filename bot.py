@@ -92,7 +92,9 @@ async def cmd_start(message: Message, state: FSMContext):
     else:
         await message.answer(DISCLAIMER, parse_mode="HTML")
         await message.answer(
-            "Ё-моё, короче. Знаю все дыры в городе — заброшки, крыши, бомбари.\n\nКак тебя кличут?",
+            "Здорово, пта. Я тут из рода экскурсоводов — знаю почти все дыры в городе.\n\n"
+            "Может, тебе понадобятся крыши. Может, заброшки. А может вообще из этих — диггеры, подвалы всякие.\n\n"
+            "Ты скажи как тебя кличут, а я пока подыщу что тебе понадобится.",
             reply_markup=ReplyKeyboardRemove(),
         )
         await state.set_state(Reg.name)
