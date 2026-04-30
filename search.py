@@ -84,6 +84,8 @@ async def search_objects(obj_type: str, city: str) -> list:
         for i, obj in enumerate(objects):
             if i < len(images):
                 obj["image"] = images[i]
+            if i < len(results):
+                obj["published_date"] = results[i].get("published_date", "")
         return objects
     except Exception:
         return []
