@@ -1,4 +1,4 @@
-# Telegram-бот по поиску заброшек и крыш. Интерфейс: тиндер — по одному объекту.
+# Telegram-бот по поиску заброшенных объектов. Интерфейс: тиндер — по одному объекту.
 
 import json
 import logging
@@ -28,7 +28,7 @@ _shown_global: dict[int, set] = {}
 
 DISCLAIMER = (
     "⚠️ <b>Стоп, читай сюда.</b>\n\n"
-    "Этот бот даёт инфу про заброшки и крыши в твоём городе.\n\n"
+    "Этот бот даёт инфу про заброшенные объекты в твоём городе.\n\n"
     "Бот и его создатель <b>не несут никакой ответственности</b> за то, что с тобой случится — "
     "поймает охрана, полиция, провалишься, упадёшь, получишь штраф или ещё что.\n\n"
     "Всё что ты делаешь — на свой страх и риск. Сам полез — сам отвечаешь.\n\n"
@@ -44,7 +44,7 @@ STALE_NOTE = "⚡ Не серчай, инфа может быть устарев
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🏚️ Заброшка"), KeyboardButton(text="🏗️ Крыша")],
+        [KeyboardButton(text="🏚️ Заброшка")],
         [KeyboardButton(text="🔍 Поиск по названию"), KeyboardButton(text="🏙️ Сменить город")],
     ],
     resize_keyboard=True,
@@ -55,8 +55,8 @@ NAV_KB = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="🔄 Заново", callback_data="restart"),
 ]])
 
-MENU_BUTTONS = {"🏚️ Заброшка", "🏗️ Крыша", "🔍 Поиск по названию", "🏙️ Сменить город"}
-OBJ_TYPE_NAMES = {"zabroshka": "заброшки", "roof": "крыши"}
+MENU_BUTTONS = {"🏚️ Заброшка", "🔍 Поиск по названию", "🏙️ Сменить город"}
+OBJ_TYPE_NAMES = {"zabroshka": "заброшки"}
 
 CITY_ALIASES = {
     "мск": "Москва", "москва": "Москва",
@@ -129,7 +129,7 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(DISCLAIMER, parse_mode="HTML")
         await message.answer(
             "Здорово, ёпта. Я тут из рода экскурсоводов — знаю почти все дыры в городе.\n\n"
-            "Может, тебе понадобятся крыши. Может, заброшки.\n\n"
+            "Знаю заброшенные объекты почти в каждом городе.\n\n"
             "Из какого ты города? Пиши как угодно — МСК, ЕКБ, Питер, полное название.",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -265,15 +265,6 @@ async def handle_zabroshka(message: Message, state: FSMContext):
         return
     await state.clear()
     await start_browsing(message, state, "zabroshka", user["city"])
-
-
-@dp.message(F.text == "🏗️ Крыша")
-async def handle_roof(message: Message, state: FSMContext):
-    user = await _require_user(message)
-    if not user:
-        return
-    await state.clear()
-    await start_browsing(message, state, "roof", user["city"])
 
 
 @dp.message(F.text == "🏙️ Сменить город")

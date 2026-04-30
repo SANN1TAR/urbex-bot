@@ -1,5 +1,5 @@
 # Поиск объектов по иерархии источников: Викимапия → Урбантрип → Telegram → VK → общий
-# Получает: тип объекта (zabroshka/roof), город, список уже показанных
+# Получает: тип объекта (zabroshka), город, список уже показанных
 # Отдаёт: список объектов с координатами/адресом, описанием, фото
 
 import asyncio
@@ -8,29 +8,40 @@ import logging
 import os
 import re
 
-from groq import Groq
+import google.generativeai as genai
 from tavily import TavilyClient
 from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+_gemini_model = genai.GenerativeModel("gemini-2.0-flash")
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 NO_LIST = "Нельзя: МГУ, Кремль, телебашни, Москва-Сити, ВДНХ, Останкино, госучреждения."
 
 BANNED_WORDS = {
-    # Небоскрёбы и бизнес
+    # Небоскрёбы и бизнес-центры
     "москва-сити", "moscow city", "москва сити", "сити", "федерация",
     "эволюция", "империя", "меркурий", "нафта", "око", "башня 2000",
-    # Госучреждения
+    "бизнес-центр", "бизнес центр", "офисный центр", "технопарк",
+    # Госучреждения и силовые структуры
     "кремль", "мгу", "вднх", "лужники", "газпром", "фсб", "фсо", "минобороны",
     "останкино", "останкинская", "большой театр", "гум", "цум",
+    "администрация", "мэрия", "правительство", "министерство", "прокуратура",
+    "полиция", "суд", "тюрьма", "следственный", "росгвардия",
+    # Действующие предприятия
+    "действующий завод", "работающий завод", "действующая фабрика",
+    "торговый центр", "торговый комплекс", "тц ", "тк ", "молл",
+    "гипермаркет", "супермаркет", "магазин", "рынок",
+    "ресторан", "кафе", "отель", "гостиница", "хостел",
     # Парки и общественные пространства
-    "сквер", "парк", "аллея", "алея", "фонтан", "бульвар", "набережная",
+    "сквер", "парк культуры", "аллея", "фонтан", "бульвар", "набережная",
     "музей", "дом-музей", "галерея", "выставка", "мемориал", "памятник",
     "ботанический", "зоопарк", "цирк", "стадион", "арена",
+    # Жилые дома
+    "жилой дом", "жилой квартал", "жилой комплекс", "жк ", "многоквартирный",
 }
 
 
@@ -50,10 +61,21 @@ SOURCES = [
 
 BASE_QUERIES = {
     "zabroshka": "заброшка здание адрес координаты урбекс",
-    "roof": "руф крыша высотка залаз адрес",
 }
 
 _counters: dict = {}
+
+
+def _normalize_name(name: str) -> str:
+    name = name.lower().strip()
+    name = re.sub(r'[«»"\'.,\-–—()]', '', name)
+    name = re.sub(r'\s+', ' ', name)
+    return name
+
+
+def _is_shown(name: str, shown: set) -> bool:
+    norm = _normalize_name(name)
+    return any(_normalize_name(s) == norm for s in shown)
 
 
 def _parse_json(text: str):
@@ -91,18 +113,13 @@ def _tavily(query: str, images: bool = False) -> dict:
     return tavily_client.search(query, max_results=8, include_images=images)
 
 
-def _groq(prompt: str) -> str:
-    return groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-    ).choices[0].message.content
+def _gemini(prompt: str) -> str:
+    return _gemini_model.generate_content(prompt).text
 
 
-async def _get_photo(name: str, city: str, obj_type: str) -> str:
-    suffix = "здание фасад заброшка" if obj_type == "zabroshka" else "высотка крыша"
+async def _get_photo(name: str, city: str) -> str:
     try:
-        r = await asyncio.to_thread(_tavily, f"{name} {city} {suffix}", True)
+        r = await asyncio.to_thread(_tavily, f"{name} {city} здание фасад заброшка", True)
         imgs = r.get("images", [])
         return imgs[0] if imgs else ""
     except Exception:
@@ -110,32 +127,24 @@ async def _get_photo(name: str, city: str, obj_type: str) -> str:
 
 
 def _build_prompt(obj_type: str, city: str, results: list, shown: set) -> str:
-    task = (
-        f"Найди 3 точки для руфинга (крыша жилой/нежилой высотки) в {city}. {NO_LIST} Не аренда, не рестораны."
-        if obj_type == "roof"
-        else f"Найди 3 заброшенных объекта в {city}. {NO_LIST} Малоизвестные реальные заброшки."
-    )
+    task = f"Найди 3 заброшенных объекта в {city}. {NO_LIST} Малоизвестные реальные заброшки."
     exclude = f"\n\nСТРОГО НЕ ПОВТОРЯТЬ:\n" + "\n".join(f"- {n}" for n in shown) if shown else ""
     data = "\n".join(f"- {r['title']}: {r['content']}" for r in results)
 
     return f"""{task}{exclude}
 
-Отвечай ТОЛЬКО на русском языке.
+СТРОГИЕ ПРАВИЛА — нарушение недопустимо:
+1. Только реально заброшенные объекты — не действующие заводы, жилые дома, госучреждения, торговые центры, парки.
+2. coords — ТОЛЬКО если координаты прямо написаны в данных ниже. Не угадывать, не вычислять, не придумывать. Если нет — пустая строка "".
+3. address — только конкретная улица с номером или район. Если нет точного адреса — пустая строка "". Не писать просто название города.
+4. Отвечай ТОЛЬКО на русском языке.
+5. Возвращай ТОЛЬКО JSON, без пояснений.
 
-Для каждого объекта:
-- name: название
-- coords: координаты "55.7558, 37.6173" — ТОЛЬКО если есть в тексте ниже
-- address: конкретная улица с номером или название района. Не писать просто название города.
-- description: состояние, атмосфера. Без ссылок.
-- security: охрана/залаз — только если есть инфа
-
-Данные:
+Данные из источников:
 {data}
 
-JSON массив:
+JSON массив (меньше 3 — дай сколько есть, ничего нет — верни []):
 [{{"name":"...","coords":"...","address":"...","description":"...","security":"..."}}]
-
-Меньше 3 — дай сколько есть. Нет ничего — верни [].
 """
 
 
@@ -162,29 +171,29 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
             continue
 
         try:
-            text = await asyncio.to_thread(_groq, _build_prompt(obj_type, city, results, shown))
-            logger.info(f"Groq: {text[:100]}")
+            text = await asyncio.to_thread(_gemini, _build_prompt(obj_type, city, results, shown))
+            logger.info(f"Gemini: {text[:100]}")
             objects = _parse_json(text)
         except Exception:
             continue
 
-        objects = [o for o in objects if not _is_banned(o)]
+        objects = [o for o in objects if not _is_banned(o) and not _is_shown(o.get("name", ""), shown)]
         if objects:
             for i, obj in enumerate(objects):
                 _process_obj(obj, results, i, city)
                 obj["source_name"] = source_name
-                obj["image"] = await _get_photo(obj.get("name", ""), city, obj_type)
+                obj["image"] = await _get_photo(obj.get("name", ""), city)
             return objects
 
     # Финальный резерв — без ограничений по shown
     try:
         results = (await asyncio.to_thread(_tavily, base)).get("results", [])
-        text = await asyncio.to_thread(_groq, _build_prompt(obj_type, city, results, set()))
+        text = await asyncio.to_thread(_gemini, _build_prompt(obj_type, city, results, set()))
         objects = [o for o in _parse_json(text) if not _is_banned(o)]
         for i, obj in enumerate(objects):
             _process_obj(obj, results, i, city)
             obj["source_name"] = "интернет"
-            obj["image"] = await _get_photo(obj.get("name", ""), city, obj_type)
+            obj["image"] = await _get_photo(obj.get("name", ""), city)
         return objects
     except Exception:
         return []
@@ -192,7 +201,7 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
 
 async def search_by_name(name: str, city: str) -> dict:
     try:
-        response = await asyncio.to_thread(_tavily, f"{name} {city} заброшка крыша", True)
+        response = await asyncio.to_thread(_tavily, f"{name} {city} заброшка урбекс", True)
         results = response.get("results", [])
         images = response.get("images", [])
     except Exception:
@@ -214,12 +223,12 @@ JSON:
 """
 
     try:
-        text = await asyncio.to_thread(_groq, prompt)
+        text = await asyncio.to_thread(_gemini, prompt)
         result = _parse_json(text)
         if not result.get("not_found"):
             result["description"] = _clean(result.get("description", ""))
             result["address"] = _clean_address(result.get("address", ""), city)
-            result["image"] = images[0] if images else await _get_photo(name, city, "zabroshka")
+            result["image"] = images[0] if images else await _get_photo(name, city)
         return result
     except Exception:
         return {"not_found": True}
