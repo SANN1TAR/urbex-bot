@@ -101,11 +101,12 @@ def _format_obj(num: int, obj: dict) -> str:
 
     coords = obj.get("coords", "")
     address = obj.get("address", "")
-    location_line = ""
-    if address:
-        location_line = f"\n📍 {address}"
     if coords:
-        location_line += f"\n🗺 {coords}"
+        location_line = f"\n🗺 {coords}"
+    elif address:
+        location_line = f"\n📍 {address}"
+    else:
+        location_line = ""
     prefix = f"{num}. " if num > 0 else ""
     description = _clean_text(obj.get("description", ""))
     security = _clean_text(obj.get("security", ""))
