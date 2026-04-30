@@ -137,6 +137,11 @@ async def send_objects(message: Message, state: FSMContext, obj_type: str, city:
     shown = [obj.get("name", "") for obj in objects]
     await _send_results(message, objects)
 
+    await message.answer(
+        "⚡ Не серчай, но часть инфы может быть устаревшей — я за этим не слежу. "
+        "Перед вылазкой лучше перепроверь сам."
+    )
+
     await state.set_state(Browsing.active)
     await state.update_data(obj_type=obj_type, city=city, shown=shown)
     await message.answer("Ещё поискать или хватит?", reply_markup=MORE_KB)
