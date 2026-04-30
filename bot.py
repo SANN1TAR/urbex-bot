@@ -90,10 +90,13 @@ def _format_obj(num: int, obj: dict) -> str:
     security = obj.get("security", "")
     sec_line = f"\n🔒 Охрана: {security}" if security and security.lower() != "неизвестно" else ""
 
+    coords = obj.get("coords", "")
+    coords_line = f"\n🗺 Координаты: {coords}" if coords else ""
     prefix = f"{num}. " if num > 0 else ""
     return (
         f"<b>{prefix}{obj.get('name', 'Без названия')}</b>\n"
-        f"📍 {obj.get('address', 'адрес неизвестен')}\n\n"
+        f"📍 {obj.get('address', 'адрес неизвестен')}"
+        f"{coords_line}\n\n"
         f"{obj.get('description', '')}"
         f"{sec_line}"
         f"{date_line}"
