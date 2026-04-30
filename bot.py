@@ -48,6 +48,8 @@ STALE_NOTE = (
     "Перед вылазкой лучше перепроверь сам."
 )
 
+MENU_BUTTONS = {"🏚️ Заброшка", "🏗️ Крыша", "🔍 Поиск по названию", "🏙️ Сменить город"}
+
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🏚️ Заброшка"), KeyboardButton(text="🏗️ Крыша")],
@@ -137,6 +139,11 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @dp.message(Reg.city)
 async def reg_city(message: Message, state: FSMContext):
+    if message.text in MENU_BUTTONS:
+        await state.clear()
+        await message.answer("Сначала напиши город:", reply_markup=ReplyKeyboardRemove())
+        await state.set_state(Reg.city)
+        return
     city = _resolve_city(message.text)
     await save_user(message.from_user.id, city)
     await state.clear()
@@ -253,6 +260,10 @@ async def handle_search_prompt(message: Message, state: FSMContext):
 
 @dp.message(Search.query)
 async def handle_search_query(message: Message, state: FSMContext):
+    if message.text in MENU_BUTTONS:
+        await state.clear()
+        await message.answer("Выбирай:", reply_markup=MAIN_KB)
+        return
     query = message.text.strip()
     await state.clear()
     user = await get_user(message.from_user.id)
