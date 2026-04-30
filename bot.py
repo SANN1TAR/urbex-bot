@@ -1,6 +1,6 @@
 # Главный файл Telegram-бота по поиску заброшек, руфов и бомбарей
 # Получает: сообщения от пользователей в Telegram
-# Отдаёт: результаты поиска с названием, адресом, описанием и фото
+# Отдаёт: результаты поиска с названием, адресом, описанием
 
 import asyncio
 import logging
@@ -30,6 +30,20 @@ logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
 dp = Dispatcher(storage=MemoryStorage())
+
+DISCLAIMER = (
+    "⚠️ <b>Стоп, читай сюда.</b>\n\n"
+    "Этот бот даёт инфу про заброшки, крыши и бомбари в твоём городе.\n\n"
+    "Бот и его создатель <b>не несут никакой ответственности</b> за то, что с тобой случится — "
+    "поймает охрана, полиция, провалишься, упадёшь, получишь штраф или ещё что.\n\n"
+    "Всё что ты делаешь — ты делаешь на свой страх и риск. Сам полез — сам отвечаешь.\n\n"
+    "Удачных вылазок. 🚪"
+)
+
+VPN_NOTE = (
+    "🔒 <b>Важно:</b> часть ссылок ведёт в инстаграм и ютуб. "
+    "Если у тебя они не открываются — врубай VPN, иначе половина инфы будет недоступна."
+)
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
@@ -76,8 +90,9 @@ async def cmd_start(message: Message, state: FSMContext):
             reply_markup=MAIN_KB,
         )
     else:
+        await message.answer(DISCLAIMER, parse_mode="HTML")
         await message.answer(
-            "Ё-моё, привет. Я знаю все дыры в городе — заброшки, крыши, бомбари.\n\nКак тебя кличут?",
+            "Ё-моё, короче. Знаю все дыры в городе — заброшки, крыши, бомбари.\n\nКак тебя кличут?",
             reply_markup=ReplyKeyboardRemove(),
         )
         await state.set_state(Reg.name)
@@ -96,6 +111,7 @@ async def reg_city(message: Message, state: FSMContext):
     city = message.text.strip()
     await save_user(message.from_user.id, data["name"], city)
     await state.clear()
+    await message.answer(VPN_NOTE, parse_mode="HTML")
     await message.answer(
         f"{city} — знаю там пару мест. Чё ищешь?",
         reply_markup=MAIN_KB,
@@ -111,7 +127,6 @@ def _date_note(pub_date: str) -> str:
 async def send_objects(message: Message, state: FSMContext, obj_type: str, city: str):
     type_name = OBJ_TYPE_NAMES[obj_type]
     await message.answer(f"Ща пробью {type_name} в {city}... 🔍")
-
     objects = await search_objects(obj_type, city)
 
     if not objects:
@@ -128,15 +143,7 @@ async def send_objects(message: Message, state: FSMContext, obj_type: str, city:
 
 async def _send_results(message: Message, objects: list):
     for i, obj in enumerate(objects, 1):
-        image = obj.get("image", "")
-        if image:
-            try:
-                await message.answer_photo(photo=image, caption="📸 Фото из поиска")
-            except Exception:
-                pass
-
         date_note = _date_note(obj.get("published_date", ""))
-
         await message.answer(
             f"<b>{i}. {obj.get('name', 'Без названия')}</b>\n"
             f"📍 {obj.get('address', 'адрес неизвестен')}\n\n"
@@ -156,9 +163,9 @@ async def handle_more(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     obj_type = data.get("obj_type")
     city = data.get("city")
+    shown = data.get("shown", [])
     type_name = OBJ_TYPE_NAMES.get(obj_type, "объекты")
 
-    shown = data.get("shown", [])
     await callback.message.answer(f"Ищу ещё {type_name}... 🔍")
     objects = await search_objects(obj_type, city, shown=shown)
 
@@ -234,14 +241,7 @@ async def handle_search_query(message: Message, state: FSMContext):
         await message.answer(f"Хрен знает что за '{query}'. Не нашёл ничего.")
         return
 
-    for img_url in result.get("images", [])[:2]:
-        try:
-            await message.answer_photo(photo=img_url, caption="📸 Фото из поиска")
-        except Exception:
-            pass
-
     date_note = _date_note(result.get("published_date", ""))
-
     await message.answer(
         f"<b>{result.get('name', query)}</b>\n"
         f"📍 {result.get('address', 'адрес неизвестен')}\n\n"
