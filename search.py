@@ -1,5 +1,5 @@
 # Поиск объектов через Tavily + обработка результатов через Groq
-# Получает: тип объекта (заброшка/крыша/бомбарь) и город
+# Получает: тип объекта (zabroshka/roof) и город
 # Отдаёт: список из 3 объектов с названием, адресом, описанием, источником
 
 import asyncio
@@ -11,37 +11,16 @@ from groq import Groq
 from tavily import TavilyClient
 from dotenv import load_dotenv
 
-logger = logging.getLogger(__name__)
-
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
-
-SEARCH_QUERIES = {
-    "zabroshka": "заброшенное здание урбекс",
-    "roof": "руфинг крышелазание высотка",
-}
 
 TYPE_NAMES = {
     "zabroshka": "заброшка",
     "roof": "крыша",
 }
-
-
-def _parse_json(text: str):
-    text = text.strip()
-    if "```" in text:
-        parts = text.split("```")
-        text = parts[1] if len(parts) > 1 else text
-        if text.startswith("json"):
-            text = text[4:]
-    return json.loads(text.strip())
-
-
-def _format_results(results: list) -> str:
-    return "\n".join(f"- {r['title']}: {r['content']} (URL: {r['url']})" for r in results)
-
 
 QUERY_VARIANTS = {
     "zabroshka": [
@@ -59,33 +38,42 @@ QUERY_VARIANTS = {
 _query_counters: dict = {}
 
 
+def _parse_json(text: str):
+    text = text.strip()
+    if "```" in text:
+        parts = text.split("```")
+        text = parts[1] if len(parts) > 1 else text
+        if text.startswith("json"):
+            text = text[4:]
+    return json.loads(text.strip())
+
+
+def _format_results(results: list) -> str:
+    return "\n".join(f"- {r['title']}: {r['content']} (URL: {r['url']})" for r in results)
+
+
 def _tavily_search(query: str) -> dict:
-    return tavily.search(query, max_results=10, include_images=True)
+    return tavily.search(query, max_results=10)
 
 
 def _groq_ask(prompt: str) -> str:
-    completion = groq.chat.completions.create(
+    return groq.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
-    )
-    return completion.choices[0].message.content
+    ).choices[0].message.content
 
 
 async def search_objects(obj_type: str, city: str, shown: list | None = None) -> list:
     shown = shown or []
 
-    counter = _query_counters.get(f"{obj_type}_{city}", 0)
-    variants = QUERY_VARIANTS[obj_type]
-    query_base = variants[counter % len(variants)]
-    _query_counters[f"{obj_type}_{city}"] = counter + 1
+    key = f"{obj_type}_{city}"
+    counter = _query_counters.get(key, 0)
+    query_base = QUERY_VARIANTS[obj_type][counter % len(QUERY_VARIANTS[obj_type])]
+    _query_counters[key] = counter + 1
 
-    query = f"{query_base} {city}"
-    response = await asyncio.to_thread(_tavily_search, query)
-
+    response = await asyncio.to_thread(_tavily_search, f"{query_base} {city}")
     results = response.get("results", [])
-    images = response.get("images", [])
-    logger.info(f"Tavily вернул {len(results)} результатов и {len(images)} фото: {images[:3]}")
 
     if not results:
         return []
@@ -94,11 +82,11 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
 
     prompt = f"""Из результатов поиска выдели 3 реальных РАЗНЫХ конкретных объекта типа "{TYPE_NAMES[obj_type]}" в городе {city}.
 {exclude}
-Для каждого объекта нужно:
+Для каждого объекта:
 - name: название объекта или здания
 - address: ТОЧНЫЙ адрес — улица, номер дома. Если нет точного — район и ориентир
-- description: что это за место, какой вид/атмосфера, особенности объекта
-- security: есть ли охрана, замки, камеры, сложность попадания — если инфа есть. Если нет — напиши "неизвестно"
+- description: что это за место, какой вид/атмосфера, особенности
+- security: охрана, замки, камеры, сложность попадания. Если инфы нет — не включай поле
 - source: URL откуда взята инфа
 
 Результаты:
@@ -107,8 +95,7 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
 Ответь строго JSON массивом без лишнего текста:
 [{{"name":"...","address":"...","description":"...","security":"...","source":"..."}}]
 
-Важно: нужны конкретные точки с адресами, а не общие статьи про руфинг или урбекс.
-Если объектов меньше 3 — дай сколько есть. Если нет совсем — верни [].
+Нужны конкретные точки с адресами, не общие статьи. Если объектов меньше 3 — дай сколько есть. Если нет — верни [].
 """
 
     text = await asyncio.to_thread(_groq_ask, prompt)
@@ -116,8 +103,6 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
     try:
         objects = _parse_json(text)
         for i, obj in enumerate(objects):
-            if i < len(images):
-                obj["image"] = images[i]
             if i < len(results):
                 obj["published_date"] = results[i].get("published_date", "")
         return objects
@@ -126,11 +111,8 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
 
 
 async def search_by_name(name: str, city: str) -> dict:
-    query = f"{name} {city} заброшка бомбарь крыша"
-    response = await asyncio.to_thread(_tavily_search, query)
-
+    response = await asyncio.to_thread(_tavily_search, f"{name} {city} заброшка крыша")
     results = response.get("results", [])
-    images = response.get("images", [])
 
     if not results:
         return {"not_found": True}
@@ -149,9 +131,6 @@ async def search_by_name(name: str, city: str) -> dict:
     text = await asyncio.to_thread(_groq_ask, prompt)
 
     try:
-        result = _parse_json(text)
-        if images and not result.get("not_found"):
-            result["images"] = images[:2]
-        return result
+        return _parse_json(text)
     except Exception:
         return {"not_found": True}

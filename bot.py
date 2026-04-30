@@ -1,8 +1,7 @@
-# Главный файл Telegram-бота по поиску заброшек, руфов и бомбарей
+# Главный файл Telegram-бота по поиску заброшек и крыш
 # Получает: сообщения от пользователей в Telegram
 # Отдаёт: результаты поиска с названием, адресом, описанием
 
-import asyncio
 import logging
 import os
 
@@ -33,16 +32,21 @@ dp = Dispatcher(storage=MemoryStorage())
 
 DISCLAIMER = (
     "⚠️ <b>Стоп, читай сюда.</b>\n\n"
-    "Этот бот даёт инфу про заброшки, крыши и бомбари в твоём городе.\n\n"
+    "Этот бот даёт инфу про заброшки и крыши в твоём городе.\n\n"
     "Бот и его создатель <b>не несут никакой ответственности</b> за то, что с тобой случится — "
     "поймает охрана, полиция, провалишься, упадёшь, получишь штраф или ещё что.\n\n"
-    "Всё что ты делаешь — ты делаешь на свой страх и риск. Сам полез — сам отвечаешь.\n\n"
+    "Всё что ты делаешь — на свой страх и риск. Сам полез — сам отвечаешь.\n\n"
     "Удачных вылазок. 🚪"
 )
 
 VPN_NOTE = (
     "🔒 <b>Важно:</b> часть ссылок ведёт в инстаграм и ютуб. "
-    "Если у тебя они не открываются — врубай VPN, иначе половина инфы будет недоступна."
+    "Если не открываются — врубай VPN, иначе половина инфы будет недоступна."
+)
+
+STALE_NOTE = (
+    "⚡ Не серчай, но часть инфы может быть устаревшей — я за этим не слежу. "
+    "Перед вылазкой лучше перепроверь сам."
 )
 
 MAIN_KB = ReplyKeyboardMarkup(
@@ -53,12 +57,10 @@ MAIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-MORE_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [
-        InlineKeyboardButton(text="🔥 Ещё 3", callback_data="more"),
-        InlineKeyboardButton(text="✅ Достаточно", callback_data="enough"),
-    ]
-])
+MORE_KB = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="🔥 Ещё 3", callback_data="more"),
+    InlineKeyboardButton(text="✅ Достаточно", callback_data="enough"),
+]])
 
 CITY_ALIASES = {
     "мск": "Москва", "москва": "Москва",
@@ -75,14 +77,27 @@ CITY_ALIASES = {
     "аст": "Астана", "астана": "Астана", "нур": "Астана",
 }
 
-OBJ_TYPE_NAMES = {
-    "zabroshka": "заброшки",
-    "roof": "крыши",
-}
+OBJ_TYPE_NAMES = {"zabroshka": "заброшки", "roof": "крыши"}
 
 
 def _resolve_city(raw: str) -> str:
     return CITY_ALIASES.get(raw.lower().strip(), raw.strip().title())
+
+
+def _format_obj(num: int, obj: dict) -> str:
+    date = obj.get("published_date", "")
+    date_line = f"\n📅 Опубликовано: {date[:10]}" if date else ""
+    security = obj.get("security", "")
+    sec_line = f"\n🔒 Охрана: {security}" if security and security.lower() != "неизвестно" else ""
+
+    return (
+        f"<b>{num}. {obj.get('name', 'Без названия')}</b>\n"
+        f"📍 {obj.get('address', 'адрес неизвестен')}\n\n"
+        f"{obj.get('description', '')}"
+        f"{sec_line}"
+        f"{date_line}\n\n"
+        f"🔗 {obj.get('source', '')}"
+    )
 
 
 class Reg(StatesGroup):
@@ -123,56 +138,27 @@ async def reg_city(message: Message, state: FSMContext):
     await save_user(message.from_user.id, city)
     await state.clear()
     await message.answer(VPN_NOTE, parse_mode="HTML")
-    await message.answer(
-        f"{city} — знаю там пару мест. Чё ищешь?",
-        reply_markup=MAIN_KB,
-    )
+    await message.answer(f"{city} — знаю там пару мест. Чё ищешь?", reply_markup=MAIN_KB)
 
 
-def _date_note(pub_date: str) -> str:
-    if not pub_date:
-        return ""
-    return f"\n📅 Опубликовано: {pub_date[:10]}"
+async def _send_results(message: Message, objects: list):
+    for i, obj in enumerate(objects, 1):
+        await message.answer(_format_obj(i, obj), parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def send_objects(message: Message, state: FSMContext, obj_type: str, city: str):
-    type_name = OBJ_TYPE_NAMES[obj_type]
-    await message.answer(f"Ща пробью {type_name} в {city}... 🔍")
+    await message.answer(f"Ща пробью {OBJ_TYPE_NAMES[obj_type]} в {city}... 🔍")
     objects = await search_objects(obj_type, city)
 
     if not objects:
         await message.answer("Пусто. Либо нет инфы, либо всё снесли. Попробуй позже.")
         return
 
-    shown = [obj.get("name", "") for obj in objects]
     await _send_results(message, objects)
-
-    await message.answer(
-        "⚡ Не серчай, но часть инфы может быть устаревшей — я за этим не слежу. "
-        "Перед вылазкой лучше перепроверь сам."
-    )
-
+    await message.answer(STALE_NOTE)
     await state.set_state(Browsing.active)
-    await state.update_data(obj_type=obj_type, city=city, shown=shown)
+    await state.update_data(obj_type=obj_type, city=city, shown=[o.get("name", "") for o in objects])
     await message.answer("Ещё поискать или хватит?", reply_markup=MORE_KB)
-
-
-async def _send_results(message: Message, objects: list):
-    for i, obj in enumerate(objects, 1):
-        date_note = _date_note(obj.get("published_date", ""))
-        security = obj.get("security", "")
-        security_line = f"\n🔒 Охрана: {security}" if security else ""
-
-        await message.answer(
-            f"<b>{i}. {obj.get('name', 'Без названия')}</b>\n"
-            f"📍 {obj.get('address', 'адрес неизвестен')}\n\n"
-            f"{obj.get('description', '')}"
-            f"{security_line}"
-            f"{date_note}\n\n"
-            f"🔗 {obj.get('source', '')}",
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
 
 
 @dp.callback_query(F.data == "more", Browsing.active)
@@ -184,9 +170,8 @@ async def handle_more(callback: CallbackQuery, state: FSMContext):
     obj_type = data.get("obj_type")
     city = data.get("city")
     shown = data.get("shown", [])
-    type_name = OBJ_TYPE_NAMES.get(obj_type, "объекты")
 
-    await callback.message.answer(f"Ищу ещё {type_name}... 🔍")
+    await callback.message.answer(f"Ищу ещё {OBJ_TYPE_NAMES.get(obj_type, 'объекты')}... 🔍")
     objects = await search_objects(obj_type, city, shown=shown)
 
     if not objects:
@@ -194,9 +179,9 @@ async def handle_more(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
-    shown += [obj.get("name", "") for obj in objects]
     await _send_results(callback.message, objects)
-    await state.update_data(shown=shown)
+    await callback.message.answer(STALE_NOTE)
+    await state.update_data(shown=shown + [o.get("name", "") for o in objects])
     await callback.message.answer("Ещё поискать или хватит?", reply_markup=MORE_KB)
 
 
@@ -208,11 +193,17 @@ async def handle_enough(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("Ок, завязали. Чё ещё надо?", reply_markup=MAIN_KB)
 
 
-@dp.message(F.text == "🏚️ Заброшка")
-async def handle_zabroshka(message: Message, state: FSMContext):
+async def _require_user(message: Message) -> dict | None:
     user = await get_user(message.from_user.id)
     if not user:
         await message.answer("Сначала зарегистрируйся — напиши /start")
+    return user
+
+
+@dp.message(F.text == "🏚️ Заброшка")
+async def handle_zabroshka(message: Message, state: FSMContext):
+    user = await _require_user(message)
+    if not user:
         return
     await state.clear()
     await send_objects(message, state, "zabroshka", user["city"])
@@ -220,20 +211,17 @@ async def handle_zabroshka(message: Message, state: FSMContext):
 
 @dp.message(F.text == "🏗️ Крыша")
 async def handle_roof(message: Message, state: FSMContext):
-    user = await get_user(message.from_user.id)
+    user = await _require_user(message)
     if not user:
-        await message.answer("Сначала зарегистрируйся — напиши /start")
         return
     await state.clear()
     await send_objects(message, state, "roof", user["city"])
 
 
-
 @dp.message(F.text == "🔍 Поиск по названию")
 async def handle_search_prompt(message: Message, state: FSMContext):
-    user = await get_user(message.from_user.id)
+    user = await _require_user(message)
     if not user:
-        await message.answer("Сначала зарегистрируйся — напиши /start")
         return
     await state.clear()
     await message.answer("Называй объект, пробью что знаю:")
@@ -252,16 +240,7 @@ async def handle_search_query(message: Message, state: FSMContext):
         await message.answer(f"Хрен знает что за '{query}'. Не нашёл ничего.")
         return
 
-    date_note = _date_note(result.get("published_date", ""))
-    await message.answer(
-        f"<b>{result.get('name', query)}</b>\n"
-        f"📍 {result.get('address', 'адрес неизвестен')}\n\n"
-        f"{result.get('description', '')}"
-        f"{date_note}\n\n"
-        f"🔗 {result.get('source', '')}",
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
+    await message.answer(_format_obj(0, result).lstrip("0. "), parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def main():
@@ -270,4 +249,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
