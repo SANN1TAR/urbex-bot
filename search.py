@@ -133,14 +133,25 @@ JSON массив без лишнего текста:
 
     try:
         objects = _parse_json(text)
-        for i, obj in enumerate(objects):
-            obj["published_date"] = results[i].get("published_date", "") if i < len(results) else ""
-            obj["description"] = _clean(obj.get("description", ""))
-            obj["security"] = _clean(obj.get("security", ""))
-            obj["image"] = await _get_photo(obj.get("name", ""), city, obj_type)
-        return objects
     except Exception:
-        return []
+        objects = []
+
+    # Если ничего не нашёл из-за ограничений — пробуем без списка исключений
+    if not objects and shown:
+        logger.info("Повтор без exclude_block")
+        prompt2 = prompt.replace(exclude_block, "")
+        try:
+            text2 = await asyncio.to_thread(_groq, prompt2)
+            objects = _parse_json(text2)
+        except Exception:
+            objects = []
+
+    for i, obj in enumerate(objects):
+        obj["published_date"] = results[i].get("published_date", "") if i < len(results) else ""
+        obj["description"] = _clean(obj.get("description", ""))
+        obj["security"] = _clean(obj.get("security", ""))
+        obj["image"] = await _get_photo(obj.get("name", ""), city, obj_type)
+    return objects
 
 
 async def search_by_name(name: str, city: str) -> dict:

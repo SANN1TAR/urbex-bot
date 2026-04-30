@@ -174,7 +174,9 @@ async def send_objects(message: Message, state: FSMContext, obj_type: str, city:
         return
 
     new_names = {obj.get("name", "") for obj in objects}
-    _shown_global[uid] = shown | new_names
+    combined = shown | new_names
+    # Сбрасываем если слишком много — чтобы не блокировать поиск
+    _shown_global[uid] = combined if len(combined) <= 30 else new_names
 
     await _send_results(message, objects)
     await message.answer(STALE_NOTE)
