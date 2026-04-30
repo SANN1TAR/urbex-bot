@@ -100,14 +100,17 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
     if not results:
         return []
 
-    exclude = f"Уже показаны — не повторяй: {', '.join(shown)}. " if shown else ""
-
     if obj_type == "roof":
-        task = f"Найди 3 точки для руфинга (крыша жилой/нежилой высотки) в {city}. {NO_LIST} Не аренда, не рестораны. {exclude}"
+        task = f"Найди 3 точки для руфинга (крыша жилой/нежилой высотки) в {city}. {NO_LIST} Не аренда, не рестораны."
     else:
-        task = f"Найди 3 заброшенных здания или объекта в {city}. {NO_LIST} Малоизвестные реальные заброшки. {exclude}"
+        task = f"Найди 3 заброшенных здания или объекта в {city}. {NO_LIST} Малоизвестные реальные заброшки."
 
-    prompt = f"""{task}
+    exclude_block = ""
+    if shown:
+        names = "\n".join(f"- {n}" for n in shown)
+        exclude_block = f"\n\nСТРОГО ЗАПРЕЩЕНО включать эти объекты (уже показаны):\n{names}\nЕсли в данных только они — верни []."
+
+    prompt = f"""{task}{exclude_block}
 
 Для каждого:
 - name: название здания/объекта
