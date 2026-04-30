@@ -17,9 +17,9 @@ model = genai.GenerativeModel("gemini-2.0-flash")
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 SEARCH_QUERIES = {
-    "zabroshka": "заброшенное здание заброшка урбекс",
-    "roof": "руфинг крыша крышелазание высотка",
-    "digger": "бомбоубежище бомбарь подземелье дигеры",
+    "zabroshka": "заброшенное здание урбекс",
+    "roof": "руфинг крышелазание высотка",
+    "digger": "бомбоубежище дигеры подземелье",
 }
 
 TYPE_NAMES = {
@@ -29,8 +29,26 @@ TYPE_NAMES = {
 }
 
 
+def _parse_json(text: str):
+    text = text.strip()
+    if "```" in text:
+        parts = text.split("```")
+        text = parts[1] if len(parts) > 1 else text
+        if text.startswith("json"):
+            text = text[4:]
+    return json.loads(text.strip())
+
+
+def _format_results(results: list) -> str:
+    return "\n".join(f"- {r['title']}: {r['content']} (URL: {r['url']})" for r in results)
+
+
 def _tavily_search(query: str) -> dict:
-    return tavily.search(query, max_results=8, include_images=True)
+    return tavily.search(query, max_results=6, include_images=True)
+
+
+def _gemini_ask(prompt: str) -> str:
+    return model.generate_content(prompt).text
 
 
 async def search_objects(obj_type: str, city: str) -> list:
@@ -43,42 +61,22 @@ async def search_objects(obj_type: str, city: str) -> list:
     if not results:
         return []
 
-    results_text = "\n".join(
-        [f"- {r['title']}: {r['content']} (URL: {r['url']})" for r in results]
-    )
-    type_name = TYPE_NAMES[obj_type]
+    prompt = f"""Из результатов поиска выдели 3 реальных объекта типа "{TYPE_NAMES[obj_type]}" в городе {city}.
+Для каждого дай: name, address (адрес или район), description (2-3 предложения), source (URL).
 
-    prompt = f"""Ты помощник по поиску заброшенных мест, крыш и подземелий.
+Результаты:
+{_format_results(results)}
 
-Из этих результатов поиска выдели 3 реальных объекта типа "{type_name}" в городе {city}.
-Для каждого объекта дай:
-- name: название объекта
-- address: адрес или район/описание местонахождения
-- description: 2-3 предложения что это, как выглядит, особенности
-- source: URL откуда взята информация
+Ответь строго JSON массивом без лишнего текста:
+[{{"name":"...","address":"...","description":"...","source":"..."}}]
 
-Результаты поиска:
-{results_text}
-
-Ответь строго в формате JSON массива, без лишнего текста:
-[
-  {{"name": "...", "address": "...", "description": "...", "source": "..."}}
-]
-
-Если реальных объектов меньше 3 — дай сколько есть. Если совсем ничего нет — верни пустой массив [].
+Если объектов меньше 3 — дай сколько есть. Если нет совсем — верни [].
 """
 
-    response_ai = model.generate_content(prompt)
-    text = response_ai.text.strip()
-
-    if "```" in text:
-        parts = text.split("```")
-        text = parts[1] if len(parts) > 1 else text
-        if text.startswith("json"):
-            text = text[4:]
+    text = await asyncio.to_thread(_gemini_ask, prompt)
 
     try:
-        objects = json.loads(text.strip())
+        objects = _parse_json(text)
         for i, obj in enumerate(objects):
             if i < len(images):
                 obj["image"] = images[i]
@@ -88,7 +86,7 @@ async def search_objects(obj_type: str, city: str) -> list:
 
 
 async def search_by_name(name: str, city: str) -> dict:
-    query = f"{name} {city} заброшка крыша бомбарь"
+    query = f"{name} {city} заброшка бомбарь крыша"
     response = await asyncio.to_thread(_tavily_search, query)
 
     results = response.get("results", [])
@@ -97,33 +95,21 @@ async def search_by_name(name: str, city: str) -> dict:
     if not results:
         return {"not_found": True}
 
-    results_text = "\n".join(
-        [f"- {r['title']}: {r['content']} (URL: {r['url']})" for r in results]
-    )
+    prompt = f"""Найди информацию об объекте "{name}" в городе {city}.
 
-    prompt = f"""Найди информацию об объекте с названием "{name}" в городе {city}.
+Результаты:
+{_format_results(results)}
 
-Результаты поиска:
-{results_text}
+Ответь строго JSON без лишнего текста:
+{{"name":"...","address":"...","description":"...","source":"..."}}
 
-Ответь строго в формате JSON без лишнего текста:
-{{"name": "...", "address": "...", "description": "...", "source": "..."}}
-
-Если объект не найден или информации нет, ответь:
-{{"not_found": true}}
+Если не найдено — верни: {{"not_found":true}}
 """
 
-    response_ai = model.generate_content(prompt)
-    text = response_ai.text.strip()
-
-    if "```" in text:
-        parts = text.split("```")
-        text = parts[1] if len(parts) > 1 else text
-        if text.startswith("json"):
-            text = text[4:]
+    text = await asyncio.to_thread(_gemini_ask, prompt)
 
     try:
-        result = json.loads(text.strip())
+        result = _parse_json(text)
         if images and not result.get("not_found"):
             result["images"] = images[:2]
         return result
