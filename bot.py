@@ -1,9 +1,10 @@
 # Главный файл Telegram-бота по поиску заброшек и крыш
 # Получает: сообщения от пользователей в Telegram
-# Отдаёт: результаты поиска с названием, адресом, описанием
+# Отдаёт: результаты поиска с координатами, описанием и фото
 
 import logging
 import os
+import re
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -11,13 +12,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    Message,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
 )
 from dotenv import load_dotenv
 
@@ -30,6 +26,9 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
 dp = Dispatcher(storage=MemoryStorage())
 
+# Глобальная память показанных объектов до рестарта бота
+_shown_global: dict[int, set] = {}
+
 DISCLAIMER = (
     "⚠️ <b>Стоп, читай сюда.</b>\n\n"
     "Этот бот даёт инфу про заброшки и крыши в твоём городе.\n\n"
@@ -41,7 +40,7 @@ DISCLAIMER = (
 
 VPN_NOTE = (
     "🔒 <b>Важно:</b> часть ссылок ведёт в инстаграм и ютуб. "
-    "Если не открываются — врубай VPN, иначе половина инфы будет недоступна."
+    "Если не открываются — врубай VPN."
 )
 
 STALE_NOTE = (
@@ -69,8 +68,7 @@ CITY_ALIASES = {
     "нск": "Новосибирск", "новосиб": "Новосибирск",
     "ннов": "Нижний Новгород", "нн": "Нижний Новгород",
     "крд": "Краснодар", "казань": "Казань",
-    "чел": "Челябинск", "уфа": "Уфа",
-    "омск": "Омск", "самара": "Самара",
+    "чел": "Челябинск", "уфа": "Уфа", "омск": "Омск", "самара": "Самара",
     "рнд": "Ростов-на-Дону", "ростов": "Ростов-на-Дону",
     "вгд": "Волгоград", "пермь": "Пермь",
     "алм": "Алматы", "алматы": "Алматы", "алма-ата": "Алматы",
@@ -80,41 +78,26 @@ CITY_ALIASES = {
 OBJ_TYPE_NAMES = {"zabroshka": "заброшки", "roof": "крыши"}
 
 
-import re
-
 def _resolve_city(raw: str) -> str:
     return CITY_ALIASES.get(raw.lower().strip(), raw.strip().title())
 
 
-def _clean_text(text: str) -> str:
-    text = re.sub(r'https?://\S+', '', text)
-    text = re.sub(r'\b\w+\.\w{2,}\b', '', text)
-    text = re.sub(r'\s{2,}', ' ', text).strip()
-    return text
-
-
 def _format_obj(num: int, obj: dict) -> str:
-    date = obj.get("published_date", "")
-    date_line = f"\n📅 Опубликовано: {date[:10]}" if date else ""
-    security = obj.get("security", "")
-    sec_line = f"\n🔒 Охрана: {security}" if security and security.lower() != "неизвестно" else ""
-
     coords = obj.get("coords", "")
     address = obj.get("address", "")
-    if coords:
-        location_line = f"\n🗺 {coords}"
-    elif address:
-        location_line = f"\n📍 {address}"
-    else:
-        location_line = ""
-    prefix = f"{num}. " if num > 0 else ""
-    description = _clean_text(obj.get("description", ""))
-    security = _clean_text(obj.get("security", ""))
+    location = f"\n🗺 {coords}" if coords else (f"\n📍 {address}" if address else "")
+
+    date = obj.get("published_date", "")
+    date_line = f"\n📅 {date[:10]}" if date else ""
+
+    security = obj.get("security", "")
     sec_line = f"\n🔒 {security}" if security and security.lower() != "неизвестно" else ""
+
+    prefix = f"{num}. " if num > 0 else ""
     return (
         f"<b>{prefix}{obj.get('name', 'Без названия')}</b>"
-        f"{location_line}\n\n"
-        f"{description}"
+        f"{location}\n\n"
+        f"{obj.get('description', '')}"
         f"{sec_line}"
         f"{date_line}"
     )
@@ -173,17 +156,23 @@ async def _send_results(message: Message, objects: list):
 
 
 async def send_objects(message: Message, state: FSMContext, obj_type: str, city: str):
+    uid = message.from_user.id
+    shown = _shown_global.get(uid, set())
+
     await message.answer(f"Ща пробью {OBJ_TYPE_NAMES[obj_type]} в {city}... 🔍")
-    objects = await search_objects(obj_type, city)
+    objects = await search_objects(obj_type, city, shown)
 
     if not objects:
         await message.answer("Пусто. Либо нет инфы, либо всё снесли. Попробуй позже.")
         return
 
+    new_names = {obj.get("name", "") for obj in objects}
+    _shown_global[uid] = shown | new_names
+
     await _send_results(message, objects)
     await message.answer(STALE_NOTE)
     await state.set_state(Browsing.active)
-    await state.update_data(obj_type=obj_type, city=city, shown=[o.get("name", "") for o in objects])
+    await state.update_data(obj_type=obj_type, city=city)
     await message.answer("Ещё поискать или хватит?", reply_markup=MORE_KB)
 
 
@@ -195,19 +184,20 @@ async def handle_more(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     obj_type = data.get("obj_type")
     city = data.get("city")
-    shown = data.get("shown", [])
+    uid = callback.from_user.id
+    shown = _shown_global.get(uid, set())
 
-    await callback.message.answer(f"Ищу ещё {OBJ_TYPE_NAMES.get(obj_type, 'объекты')}... 🔍")
-    objects = await search_objects(obj_type, city, shown=shown)
+    await callback.message.answer(f"Ищу ещё {OBJ_TYPE_NAMES.get(obj_type)}... 🔍")
+    objects = await search_objects(obj_type, city, shown)
 
     if not objects:
         await callback.message.answer("Больше ничего не нашёл, братан.")
         await state.clear()
         return
 
+    _shown_global[uid] = shown | {obj.get("name", "") for obj in objects}
     await _send_results(callback.message, objects)
     await callback.message.answer(STALE_NOTE)
-    await state.update_data(shown=shown + [o.get("name", "") for o in objects])
     await callback.message.answer("Ещё поискать или хватит?", reply_markup=MORE_KB)
 
 
@@ -219,7 +209,7 @@ async def handle_enough(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("Ок, завязали. Чё ещё надо?", reply_markup=MAIN_KB)
 
 
-async def _require_user(message: Message) -> dict | None:
+async def _require_user(message: Message):
     user = await get_user(message.from_user.id)
     if not user:
         await message.answer("Сначала зарегистрируйся — напиши /start")
@@ -247,7 +237,7 @@ async def handle_roof(message: Message, state: FSMContext):
 @dp.message(F.text == "🏙️ Сменить город")
 async def handle_change_city(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Окей, из какого города теперь ищем?", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Из какого города теперь ищем?", reply_markup=ReplyKeyboardRemove())
     await state.set_state(Reg.city)
 
 
@@ -273,7 +263,14 @@ async def handle_search_query(message: Message, state: FSMContext):
         await message.answer(f"Хрен знает что за '{query}'. Не нашёл ничего.")
         return
 
-    await message.answer(_format_obj(0, result).lstrip("0. "), parse_mode="HTML", disable_web_page_preview=True)
+    image = result.get("image", "")
+    if image:
+        try:
+            await message.answer_photo(photo=image)
+        except Exception:
+            pass
+
+    await message.answer(_format_obj(0, result), parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def main():

@@ -1,11 +1,12 @@
-# Поиск объектов через Tavily + обработка результатов через Groq
-# Получает: тип объекта (zabroshka/roof) и город
-# Отдаёт: список из 3 объектов с названием, адресом, описанием, фото
+# Поиск объектов через Tavily + Groq
+# Получает: тип объекта (zabroshka/roof), город, список уже показанных
+# Отдаёт: список объектов с названием, координатами/адресом, описанием, фото
 
 import asyncio
 import json
 import logging
 import os
+import re
 
 import httpx
 from groq import Groq
@@ -15,28 +16,25 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-groq = Groq(api_key=os.getenv("GROQ_API_KEY"))
-tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
-TYPE_NAMES = {
-    "zabroshka": "заброшка",
-    "roof": "крыша",
-}
+TYPE_NAMES = {"zabroshka": "заброшка", "roof": "крыша для руфинга"}
 
-QUERY_VARIANTS = {
+QUERIES = {
     "zabroshka": [
-        "заброшка урбекс адрес охрана залаз сохранность wikimapia",
-        "заброшенное здание urbex как попасть охрана координаты",
-        "заброшка вход охрана описание место urbex",
+        "заброшка адрес координаты охрана wikimapia",
+        "urbex заброшенное здание вход координаты",
+        "заброшка урбекс описание место",
     ],
     "roof": [
-        "руф точка многоэтажка открытая крыша залаз вид",
-        "руфинг многоэтажка адрес как залезть на крышу",
-        "крышелазание точка жилой дом открытая крыша вид город",
+        "руф многоэтажка крыша залаз координаты",
+        "руфинг точка высотка адрес как попасть",
+        "крышелазание жилой дом открытая крыша",
     ],
 }
 
-_query_counters: dict = {}
+_counters: dict = {}
 
 
 def _parse_json(text: str):
@@ -49,195 +47,149 @@ def _parse_json(text: str):
     return json.loads(text.strip())
 
 
-def _format_results(results: list) -> str:
-    return "\n".join(f"- {r['title']}: {r['content']} (URL: {r['url']})" for r in results)
+def _clean(text: str) -> str:
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'\b\w+\.(ru|com|org|net|io)\b', '', text)
+    return re.sub(r'\s{2,}', ' ', text).strip()
 
 
-def _tavily_search(query: str) -> dict:
-    return tavily.search(query, max_results=10)
+def _sort_by_date(results: list) -> list:
+    def key(r):
+        priority = 0 if "wikimapia" in r.get("url", "") else 1
+        return (priority, r.get("published_date") or "")
+    return sorted(results, key=key)
 
 
-def _tavily_image(query: str) -> str:
-    try:
-        r = tavily.search(query, max_results=3, include_images=True)
-        images = r.get("images", [])
-        return images[0] if images else ""
-    except Exception:
-        return ""
+def _tavily(query: str, images: bool = False) -> dict:
+    return tavily_client.search(query, max_results=10, include_images=images)
 
 
-async def _wikimedia_image(query: str) -> str:
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get("https://commons.wikimedia.org/w/api.php", params={
-                "action": "query", "list": "search", "srsearch": query,
-                "srnamespace": "6", "format": "json", "srlimit": 3,
-            })
-            hits = r.json().get("query", {}).get("search", [])
-            if not hits:
-                return ""
-            title = hits[0]["title"]
-            r2 = await client.get("https://commons.wikimedia.org/w/api.php", params={
-                "action": "query", "titles": title, "prop": "imageinfo",
-                "iiprop": "url", "format": "json",
-            })
-            pages = r2.json().get("query", {}).get("pages", {})
-            for page in pages.values():
-                info = page.get("imageinfo", [])
-                if info:
-                    return info[0].get("url", "")
-    except Exception:
-        pass
-    return ""
-
-
-async def _flickr_image(query: str) -> str:
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get("https://www.flickr.com/search/", params={
-                "text": query, "license": "2,3,4,5,6,9", "media": "photos",
-                "safe_search": "1", "view_all": "1",
-            }, headers={"User-Agent": "Mozilla/5.0"})
-            import re
-            urls = re.findall(r'https://live\.staticflickr\.com/[^"\']+\.jpg', r.text)
-            return urls[0] if urls else ""
-    except Exception:
-        return ""
-
-
-async def _get_image(name: str, obj_type: str, city: str) -> str:
-    fallback = "rooftop city view" if obj_type == "roof" else "abandoned building urbex"
-
-    # 1. Wikimedia с точным названием
-    url = await _wikimedia_image(f"{name} {city}")
-    if url:
-        return url
-
-    # 2. Wikimedia с общим запросом
-    url = await _wikimedia_image(fallback)
-    if url:
-        return url
-
-    # 3. Flickr
-    url = await _flickr_image(f"{name} {fallback}")
-    return url
-
-
-def _groq_ask(prompt: str) -> str:
-    return groq.chat.completions.create(
+def _groq(prompt: str) -> str:
+    return groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
     ).choices[0].message.content
 
 
-def _sort_results(results: list) -> list:
-    def key(r):
-        url = r.get("url", "")
-        priority = 0 if "wikimapia" in url else 1
-        date = r.get("published_date") or ""
-        return (priority, date)
-    return sorted(results, key=key)
+async def _get_photo(name: str, city: str) -> str:
+    # 1. Tavily с картинками
+    try:
+        r = await asyncio.to_thread(_tavily, f"{name} {city} фото", True)
+        imgs = r.get("images", [])
+        if imgs:
+            return imgs[0]
+    except Exception:
+        pass
+
+    # 2. Wikimedia Commons
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get("https://commons.wikimedia.org/w/api.php", params={
+                "action": "query", "list": "search",
+                "srsearch": f"{name} abandoned", "srnamespace": "6",
+                "format": "json", "srlimit": 1,
+            })
+            hits = r.json().get("query", {}).get("search", [])
+            if hits:
+                r2 = await client.get("https://commons.wikimedia.org/w/api.php", params={
+                    "action": "query", "titles": hits[0]["title"],
+                    "prop": "imageinfo", "iiprop": "url", "format": "json",
+                })
+                for page in r2.json().get("query", {}).get("pages", {}).values():
+                    info = page.get("imageinfo", [])
+                    if info:
+                        return info[0].get("url", "")
+    except Exception:
+        pass
+
+    return ""
 
 
-async def search_objects(obj_type: str, city: str, shown: list | None = None) -> list:
-    shown = shown or []
-
+async def search_objects(obj_type: str, city: str, shown: set) -> list:
     key = f"{obj_type}_{city}"
-    counter = _query_counters.get(key, 0)
-    query_base = QUERY_VARIANTS[obj_type][counter % len(QUERY_VARIANTS[obj_type])]
-    _query_counters[key] = counter + 1
+    counter = _counters.get(key, 0)
+    query_base = QUERIES[obj_type][counter % len(QUERIES[obj_type])]
+    _counters[key] = counter + 1
 
-    response = await asyncio.to_thread(_tavily_search, f"{query_base} {city}")
-    results = _sort_results(response.get("results", []))
-    images = response.get("images", [])
+    response = await asyncio.to_thread(_tavily, f"{query_base} {city}")
+    results = _sort_by_date(response.get("results", []))
 
     if not results:
         return []
 
-    exclude = f"Уже показанные объекты (не повторяй их): {', '.join(shown)}.\n" if shown else ""
+    exclude = f"Уже показанные объекты — НЕ включай их: {', '.join(shown)}.\n" if shown else ""
 
     if obj_type == "roof":
-        task = f"""Найди 3 реальных конкретных точки для РУФИНГА (залезть на крышу многоэтажки) в городе {city}.
-{exclude}
-Руфинг — это когда залезают на крышу жилого или нежилого высотного здания, фотографируются, смотрят вид.
-НЕ нужны: аренда крыш, банкеты, рестораны на крыше, ремонт кровли.
-НУЖНЫ: конкретные многоэтажки или высотки, куда можно залезть на крышу.
-
-Для каждой точки:
-- name: название здания или адрес как называют в тусовке
-- coords: координаты в формате "55.7558, 37.6173" — ищи в тексте, если не нашёл — попробуй вспомнить примерные по адресу. Если совсем никак — не включай поле
-- address: улица и номер дома или район с ориентиром — только если нет координат. Если знаешь только город — не включай поле
-- description: вид с крыши, как выглядит, высота, особенности
-- security: есть ли охрана, замок на чердаке, консьерж, сложность залаза. Если нет инфы — не включай поле"""
+        task = f"""Найди 3 реальных точки для РУФИНГА (залезть на крышу многоэтажки) в городе {city}.
+{exclude}НЕ нужны: аренда крыш, рестораны, банкеты. НУЖНЫ: конкретные высотки куда залезают."""
     else:
-        task = f"""Найди 3 реальных конкретных ЗАБРОШЕННЫХ объекта в городе {city}.
-{exclude}
-Нужны реально заброшенные здания/территории — не работающие объекты.
+        task = f"""Найди 3 реальных ЗАБРОШЕННЫХ объекта в городе {city}.
+{exclude}Нужны реально заброшенные здания — не работающие объекты."""
 
-Для каждого объекта:
-- name: название заброшки
-- coords: координаты в формате "55.7558, 37.6173" — ищи в тексте, если не нашёл — попробуй вспомнить примерные по адресу. Если совсем никак — не включай поле
-- address: улица и номер дома или район с ориентиром — только если нет координат. Если знаешь только город — не включай поле
-- description: что это за место, в каком состоянии, что внутри, атмосфера
-- security: охрана, камеры, сложность попадания, как залезть. Если нет инфы — не включай поле"""
+    results_text = "\n".join(f"- {r['title']}: {r['content']} (URL: {r['url']})" for r in results)
 
     prompt = f"""{task}
 
-Результаты:
-{_format_results(results)}
+Для каждого объекта:
+- name: название
+- coords: координаты "55.7558, 37.6173" — ищи в тексте, если нет — попробуй вспомнить по названию места. Если совсем никак — не включай
+- address: улица и дом или район — только если нет coords. Если знаешь только город — не включай
+- description: состояние, атмосфера, особенности (без ссылок и названий сайтов)
+- security: охрана/залаз — если есть инфа. Если нет — не включай
 
-Ответь строго JSON массивом без лишнего текста:
-[{{"name":"...","address":"...","coords":"...","description":"...","security":"..."}}]
+Результаты поиска:
+{results_text}
 
-ВАЖНО: в description и security — никаких ссылок, названий сайтов, упоминаний YouTube, ВКонтакте или других ресурсов. Только сухая инфа об объекте.
+Ответь строго JSON массивом:
+[{{"name":"...","coords":"...","address":"...","description":"...","security":"..."}}]
+
 Если объектов меньше 3 — дай сколько есть. Если нет — верни [].
 """
 
-    text = await asyncio.to_thread(_groq_ask, prompt)
+    text = await asyncio.to_thread(_groq, prompt)
 
     try:
         objects = _parse_json(text)
         for i, obj in enumerate(objects):
             if i < len(results):
                 obj["published_date"] = results[i].get("published_date", "")
-            name = obj.get("name", "")
-            img_query = f"{name} {city} фото"
-            obj["image"] = (
-                await asyncio.to_thread(_tavily_image, img_query)
-                or await _wikimedia_image(f"{name} abandoned urbex")
-                or await _flickr_image(f"{name} urbex")
-            )
+            obj["description"] = _clean(obj.get("description", ""))
+            obj["security"] = _clean(obj.get("security", ""))
+            obj["image"] = await _get_photo(obj.get("name", ""), city)
         return objects
     except Exception:
         return []
 
 
 async def search_by_name(name: str, city: str) -> dict:
-    response = await asyncio.to_thread(_tavily_search, f"{name} {city} заброшка крыша wikimapia")
-    results = _sort_results(response.get("results", []))
+    response = await asyncio.to_thread(_tavily, f"{name} {city} заброшка крыша wikimapia", True)
+    results = _sort_by_date(response.get("results", []))
     images = response.get("images", [])
 
     if not results:
         return {"not_found": True}
 
+    results_text = "\n".join(f"- {r['title']}: {r['content']} (URL: {r['url']})" for r in results)
+
     prompt = f"""Найди информацию об объекте "{name}" в городе {city}.
 
 Результаты:
-{_format_results(results)}
+{results_text}
 
-Ответь строго JSON без лишнего текста:
-{{"name":"...","address":"...","description":"..."}}
+Ответь строго JSON:
+{{"name":"...","coords":"...","address":"...","description":"..."}}
 
 Если не найдено — верни: {{"not_found":true}}
 """
 
-    text = await asyncio.to_thread(_groq_ask, prompt)
+    text = await asyncio.to_thread(_groq, prompt)
 
     try:
         result = _parse_json(text)
-        if images and not result.get("not_found"):
-            result["image"] = images[0]
+        if not result.get("not_found"):
+            result["description"] = _clean(result.get("description", ""))
+            result["image"] = images[0] if images else await _get_photo(name, city)
         return result
     except Exception:
         return {"not_found": True}
