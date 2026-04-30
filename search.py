@@ -23,9 +23,9 @@ TYPE_NAMES = {"zabroshka": "заброшка", "roof": "крыша для руф
 
 QUERIES = {
     "zabroshka": [
-        "заброшка адрес координаты охрана wikimapia",
+        "заброшка адрес координаты охрана урбекс",
         "urbex заброшенное здание вход координаты",
-        "заброшка урбекс описание место",
+        "заброшка описание место улица",
     ],
     "roof": [
         "руф многоэтажка крыша залаз координаты",
@@ -114,6 +114,7 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
 
     response = await asyncio.to_thread(_tavily, f"{query_base} {city}")
     results = _sort_by_date(response.get("results", []))
+    logger.info(f"Tavily вернул {len(results)} результатов для '{query_base} {city}'")
 
     if not results:
         return []
@@ -149,8 +150,10 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
 
     text = await asyncio.to_thread(_groq, prompt)
 
+    logger.info(f"Groq ответил: {text[:200]}")
     try:
         objects = _parse_json(text)
+        logger.info(f"Найдено объектов: {len(objects)}")
         for i, obj in enumerate(objects):
             if i < len(results):
                 obj["published_date"] = results[i].get("published_date", "")
