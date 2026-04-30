@@ -179,8 +179,9 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
 {_format_results(results)}
 
 Ответь строго JSON массивом без лишнего текста:
-[{{"name":"...","address":"...","description":"...","security":"..."}}]
+[{{"name":"...","address":"...","coords":"...","description":"...","security":"..."}}]
 
+ВАЖНО: в description и security — никаких ссылок, названий сайтов, упоминаний YouTube, ВКонтакте или других ресурсов. Только сухая инфа об объекте.
 Если объектов меньше 3 — дай сколько есть. Если нет — верни [].
 """
 

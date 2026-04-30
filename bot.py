@@ -52,7 +52,7 @@ STALE_NOTE = (
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🏚️ Заброшка"), KeyboardButton(text="🏗️ Крыша")],
-        [KeyboardButton(text="🔍 Поиск по названию")],
+        [KeyboardButton(text="🔍 Поиск по названию"), KeyboardButton(text="🏙️ Сменить город")],
     ],
     resize_keyboard=True,
 )
@@ -80,8 +80,17 @@ CITY_ALIASES = {
 OBJ_TYPE_NAMES = {"zabroshka": "заброшки", "roof": "крыши"}
 
 
+import re
+
 def _resolve_city(raw: str) -> str:
     return CITY_ALIASES.get(raw.lower().strip(), raw.strip().title())
+
+
+def _clean_text(text: str) -> str:
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'\b\w+\.\w{2,}\b', '', text)
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
 
 
 def _format_obj(num: int, obj: dict) -> str:
@@ -91,13 +100,16 @@ def _format_obj(num: int, obj: dict) -> str:
     sec_line = f"\n🔒 Охрана: {security}" if security and security.lower() != "неизвестно" else ""
 
     coords = obj.get("coords", "")
-    coords_line = f"\n🗺 Координаты: {coords}" if coords else ""
+    coords_line = f"\n🗺 {coords}" if coords else ""
     prefix = f"{num}. " if num > 0 else ""
+    description = _clean_text(obj.get("description", ""))
+    security = _clean_text(obj.get("security", ""))
+    sec_line = f"\n🔒 {security}" if security and security.lower() != "неизвестно" else ""
     return (
         f"<b>{prefix}{obj.get('name', 'Без названия')}</b>\n"
         f"📍 {obj.get('address', 'адрес неизвестен')}"
         f"{coords_line}\n\n"
-        f"{obj.get('description', '')}"
+        f"{description}"
         f"{sec_line}"
         f"{date_line}"
     )
@@ -225,6 +237,13 @@ async def handle_roof(message: Message, state: FSMContext):
         return
     await state.clear()
     await send_objects(message, state, "roof", user["city"])
+
+
+@dp.message(F.text == "🏙️ Сменить город")
+async def handle_change_city(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Окей, из какого города теперь ищем?", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(Reg.city)
 
 
 @dp.message(F.text == "🔍 Поиск по названию")
