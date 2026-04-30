@@ -9,6 +9,7 @@ import os
 
 from groq import Groq
 from tavily import TavilyClient
+from duckduckgo_search import DDGS
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -53,7 +54,16 @@ def _format_results(results: list) -> str:
 
 
 def _tavily_search(query: str) -> dict:
-    return tavily.search(query, max_results=10, include_images=True)
+    return tavily.search(query, max_results=10)
+
+
+def _ddg_image(query: str) -> str:
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.images(query, max_results=1))
+            return results[0]["image"] if results else ""
+    except Exception:
+        return ""
 
 
 def _groq_ask(prompt: str) -> str:
@@ -114,8 +124,8 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
         for i, obj in enumerate(objects):
             if i < len(results):
                 obj["published_date"] = results[i].get("published_date", "")
-            if i < len(images):
-                obj["image"] = images[i]
+            name = obj.get("name", "")
+            obj["image"] = await asyncio.to_thread(_ddg_image, f"{name} {city} заброшка фото")
         return objects
     except Exception:
         return []
