@@ -55,6 +55,23 @@ def _clean(text: str) -> str:
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 
+_BAD_ADDR = re.compile(
+    r'^(центр|центре|рядом|около|у\s|вблизи|недалеко|неподалёку|неподалеку|район|'
+    r'московск|москва$|санкт-петербург$|питер$|екатеринбург$)',
+    re.IGNORECASE
+)
+
+
+def _validate_address(addr: str) -> str:
+    if not addr:
+        return ""
+    # Убираем если адрес слишком общий (нет цифры и нет "ул"/"пр"/"пер"/"наб")
+    has_street = bool(re.search(r'(ул\.|пр\.|пер\.|наб\.|бул\.|ш\.|пл\.|тупик|\d)', addr))
+    if not has_street or _BAD_ADDR.match(addr.strip()):
+        return ""
+    return addr
+
+
 def _tavily(query: str, images: bool = False) -> dict:
     return tavily_client.search(query, max_results=8, include_images=images)
 
@@ -146,6 +163,7 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
                 obj["published_date"] = results[i].get("published_date", "") if i < len(results) else ""
                 obj["description"] = _clean(obj.get("description", ""))
                 obj["security"] = _clean(obj.get("security", ""))
+                obj["address"] = _validate_address(obj.get("address", ""))
                 obj["image"] = await _get_photo(obj.get("name", ""), city, obj_type)
             return objects
 
@@ -166,6 +184,7 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
         obj["published_date"] = results[i].get("published_date", "") if i < len(results) else ""
         obj["description"] = _clean(obj.get("description", ""))
         obj["security"] = _clean(obj.get("security", ""))
+        obj["address"] = _validate_address(obj.get("address", ""))
         obj["image"] = await _get_photo(obj.get("name", ""), city, obj_type)
     return objects
 
