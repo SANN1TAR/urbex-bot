@@ -48,7 +48,7 @@ VPN_NOTE = (
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🏚️ Заброшка"), KeyboardButton(text="🏗️ Крыша")],
-        [KeyboardButton(text="⛏️ Бомбарь"), KeyboardButton(text="🔍 Поиск по названию")],
+        [KeyboardButton(text="🔍 Поиск по названию")],
     ],
     resize_keyboard=True,
 )
@@ -63,7 +63,6 @@ MORE_KB = InlineKeyboardMarkup(inline_keyboard=[
 OBJ_TYPE_NAMES = {
     "zabroshka": "заброшки",
     "roof": "крыши",
-    "digger": "бомбари",
 }
 
 
@@ -93,7 +92,7 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(DISCLAIMER, parse_mode="HTML")
         await message.answer(
             "Здорово, ёпта. Я тут из рода экскурсоводов — знаю почти все дыры в городе.\n\n"
-            "Может, тебе понадобятся крыши. Может, заброшки. А может вообще из этих — диггеры, подвалы всякие.\n\n"
+            "Может, тебе понадобятся крыши. Может, заброшки.\n\n"
             "Ты скажи как тебя кличут, а я пока подыщу что тебе понадобится.",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -209,15 +208,6 @@ async def handle_roof(message: Message, state: FSMContext):
     await state.clear()
     await send_objects(message, state, "roof", user["city"])
 
-
-@dp.message(F.text == "⛏️ Бомбарь")
-async def handle_digger(message: Message, state: FSMContext):
-    user = await get_user(message.from_user.id)
-    if not user:
-        await message.answer("Сначала зарегистрируйся — напиши /start")
-        return
-    await state.clear()
-    await send_objects(message, state, "digger", user["city"])
 
 
 @dp.message(F.text == "🔍 Поиск по названию")
