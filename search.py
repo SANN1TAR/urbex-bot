@@ -39,11 +39,13 @@ def _is_banned(obj: dict) -> bool:
     return any(word in text for word in BANNED_WORDS)
 
 SOURCES = [
-    "site:wikimapia.org",
-    "site:urbantrip.ru",
-    "site:t.me",
-    "site:vk.com",
-    "",
+    ("site:wikimapia.org", "Викимапия"),
+    ("site:urbantrip.ru", "Урбантрип"),
+    ("site:urbantrip.ru OR site:wikimapia.org", "Викимапия/Урбантрип"),
+    ("site:vk.com", "ВКонтакте"),
+    ("site:t.me", "Telegram"),
+    ("site:youtube.com OR site:instagram.com", "YouTube/Instagram"),
+    ("", "интернет"),
 ]
 
 BASE_QUERIES = {
@@ -148,14 +150,14 @@ def _process_obj(obj: dict, results: list, idx: int, city: str) -> dict:
 async def search_objects(obj_type: str, city: str, shown: set) -> list:
     base = f"{BASE_QUERIES[obj_type]} {city}"
 
-    for source in SOURCES:
+    for source, source_name in SOURCES:
         query = f"{base} {source}".strip()
         try:
             results = (await asyncio.to_thread(_tavily, query)).get("results", [])
         except Exception:
             continue
 
-        logger.info(f"Источник '{source or 'общий'}': {len(results)} результатов")
+        logger.info(f"Источник '{source_name}': {len(results)} результатов")
         if not results:
             continue
 
@@ -170,6 +172,7 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
         if objects:
             for i, obj in enumerate(objects):
                 _process_obj(obj, results, i, city)
+                obj["source_name"] = source_name
                 obj["image"] = await _get_photo(obj.get("name", ""), city, obj_type)
             return objects
 
@@ -180,6 +183,7 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
         objects = [o for o in _parse_json(text) if not _is_banned(o)]
         for i, obj in enumerate(objects):
             _process_obj(obj, results, i, city)
+            obj["source_name"] = "интернет"
             obj["image"] = await _get_photo(obj.get("name", ""), city, obj_type)
         return objects
     except Exception:

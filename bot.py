@@ -91,6 +91,8 @@ def _format_obj(obj: dict) -> str:
     date_line = f"\n📅 {date[:10]}" if date else ""
     security = obj.get("security", "")
     sec_line = f"\n🔒 {security}" if security and security.lower() != "неизвестно" else ""
+    source = obj.get("source_name", "")
+    source_line = f"\n🔎 Источник: {source}" if source else ""
 
     return (
         f"<b>{obj.get('name', 'Без названия')}</b>"
@@ -98,6 +100,7 @@ def _format_obj(obj: dict) -> str:
         f"{obj.get('description', '')}"
         f"{sec_line}"
         f"{date_line}"
+        f"{source_line}"
     )
 
 
