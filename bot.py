@@ -100,15 +100,19 @@ def _format_obj(num: int, obj: dict) -> str:
     sec_line = f"\n🔒 Охрана: {security}" if security and security.lower() != "неизвестно" else ""
 
     coords = obj.get("coords", "")
-    coords_line = f"\n🗺 {coords}" if coords else ""
+    address = obj.get("address", "")
+    location_line = ""
+    if address:
+        location_line = f"\n📍 {address}"
+    if coords:
+        location_line += f"\n🗺 {coords}"
     prefix = f"{num}. " if num > 0 else ""
     description = _clean_text(obj.get("description", ""))
     security = _clean_text(obj.get("security", ""))
     sec_line = f"\n🔒 {security}" if security and security.lower() != "неизвестно" else ""
     return (
-        f"<b>{prefix}{obj.get('name', 'Без названия')}</b>\n"
-        f"📍 {obj.get('address', 'адрес неизвестен')}"
-        f"{coords_line}\n\n"
+        f"<b>{prefix}{obj.get('name', 'Без названия')}</b>"
+        f"{location_line}\n\n"
         f"{description}"
         f"{sec_line}"
         f"{date_line}"

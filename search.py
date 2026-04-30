@@ -57,6 +57,15 @@ def _tavily_search(query: str) -> dict:
     return tavily.search(query, max_results=10)
 
 
+def _tavily_image(query: str) -> str:
+    try:
+        r = tavily.search(query, max_results=3, include_images=True)
+        images = r.get("images", [])
+        return images[0] if images else ""
+    except Exception:
+        return ""
+
+
 async def _wikimedia_image(query: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -157,7 +166,7 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
 
 Для каждой точки:
 - name: название здания или адрес как называют в тусовке
-- address: ТОЧНЫЙ адрес — улица, номер дома, район
+- address: ТОЧНЫЙ адрес — улица и номер дома, или район с ориентиром. Если знаешь только город — не включай поле вообще
 - coords: координаты в формате "55.7558, 37.6173" если есть в тексте, иначе не включай поле
 - description: вид с крыши, как выглядит, высота, особенности
 - security: есть ли охрана, замок на чердаке, консьерж, сложность залаза. Если нет инфы — не включай поле"""
@@ -168,7 +177,7 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
 
 Для каждого объекта:
 - name: название заброшки
-- address: ТОЧНЫЙ адрес — улица, номер дома, район, ориентир
+- address: ТОЧНЫЙ адрес — улица и номер дома, или район с ориентиром. Если знаешь только город — не включай поле вообще
 - coords: координаты в формате "55.7558, 37.6173" если есть в тексте, иначе не включай поле
 - description: что это за место, в каком состоянии, что внутри, атмосфера
 - security: охрана, камеры, сложность попадания, как залезть. Если нет инфы — не включай поле"""
@@ -193,7 +202,12 @@ async def search_objects(obj_type: str, city: str, shown: list | None = None) ->
             if i < len(results):
                 obj["published_date"] = results[i].get("published_date", "")
             name = obj.get("name", "")
-            obj["image"] = await _get_image(name, obj_type, city)
+            img_query = f"{name} {city} фото"
+            obj["image"] = (
+                await asyncio.to_thread(_tavily_image, img_query)
+                or await _wikimedia_image(f"{name} abandoned urbex")
+                or await _flickr_image(f"{name} urbex")
+            )
         return objects
     except Exception:
         return []
