@@ -126,7 +126,7 @@ def _tavily(query: str, images: bool = False) -> dict:
 def _groq(prompt: str) -> str:
     try:
         text = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="gemma2-9b-it",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
         ).choices[0].message.content
@@ -192,44 +192,48 @@ def _process_obj(obj: dict, results: list, idx: int, city: str) -> dict:
 async def search_objects(obj_type: str, city: str, shown: set) -> list:
     base = f"{BASE_QUERIES[obj_type]} {city}"
 
-    for source, source_name in SOURCES:
-        query = f"{base} {source}".strip()
-        try:
-            results = (await asyncio.to_thread(_tavily, query)).get("results", [])
-        except Exception:
+    # Собираем результаты со всех источников параллельно
+    queries = [(f"{base} {src}".strip(), name) for src, name in SOURCES]
+    tasks = [asyncio.to_thread(_tavily, q) for q, _ in queries]
+    raw = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_results = []
+    for (_, source_name), res in zip(queries, raw):
+        if isinstance(res, Exception):
             continue
+        batch = res.get("results", [])
+        logger.info(f"Источник '{source_name}': {len(batch)} результатов")
+        for r in batch[:3]:
+            r["_source"] = source_name
+            all_results.append(r)
 
-        logger.info(f"Источник '{source_name}': {len(results)} результатов")
-        if not results:
-            continue
-
-        try:
-            text = await asyncio.to_thread(_groq, _build_prompt(obj_type, city, results, shown))
-            logger.info(f"Groq: {text[:100]}")
-            objects = _parse_json(text)
-        except Exception:
-            continue
-
-        objects = [o for o in objects if not _is_banned(o) and not _is_shown(o.get("name", ""), shown)]
-        if objects:
-            for i, obj in enumerate(objects):
-                _process_obj(obj, results, i, city)
-                obj["source_name"] = source_name
-                obj["image"] = await _get_photo(obj.get("name", ""), city)
-            return _dedup_coords(objects)
-
-    # Финальный резерв — без ограничений по shown
-    try:
-        results = (await asyncio.to_thread(_tavily, base)).get("results", [])
-        text = await asyncio.to_thread(_groq, _build_prompt(obj_type, city, results, set()))
-        objects = [o for o in _parse_json(text) if not _is_banned(o)]
-        for i, obj in enumerate(objects):
-            _process_obj(obj, results, i, city)
-            obj["source_name"] = "интернет"
-            obj["image"] = await _get_photo(obj.get("name", ""), city)
-        return _dedup_coords(objects)
-    except Exception:
+    if not all_results:
         return []
+
+    # Один вызов к LLM со всеми данными
+    try:
+        text = await asyncio.to_thread(_groq, _build_prompt(obj_type, city, all_results, shown))
+        logger.info(f"Groq: {text[:100]}")
+        objects = _parse_json(text)
+    except Exception as e:
+        logger.error(f"Groq упал на финальном: {e}")
+        return []
+
+    objects = [o for o in objects if not _is_banned(o) and not _is_shown(o.get("name", ""), shown)]
+    if not objects and shown:
+        # Если всё отфильтровалось из-за shown — пробуем без него
+        try:
+            text = await asyncio.to_thread(_groq, _build_prompt(obj_type, city, all_results, set()))
+            objects = [o for o in _parse_json(text) if not _is_banned(o)]
+        except Exception:
+            return []
+
+    for i, obj in enumerate(objects):
+        _process_obj(obj, all_results, i, city)
+        obj["source_name"] = all_results[i].get("_source", "интернет") if i < len(all_results) else "интернет"
+        obj["image"] = await _get_photo(obj.get("name", ""), city)
+
+    return _dedup_coords(objects)
 
 
 async def search_by_name(name: str, city: str) -> dict:
