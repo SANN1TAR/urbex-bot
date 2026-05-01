@@ -39,10 +39,14 @@ BANNED_WORDS = {
 SOURCES = [
     "site:urban3p.ru",
     "site:urban3p.com",
-    "site:urbantrip.ru",
-    "site:urbact.ru",
-    "заброшка адрес урбекс",
 ]
+
+# Паттерны мусорных названий — статьи, топы, списки
+JUNK_RE = re.compile(
+    r'(\d+\s+заброшен|\bтоп[\s-]?\d+|\bч\.\s*\d+|часть\s+\d+|\||\bдзен\b|youtube|'
+    r'заброшенные места|лучшие заброшки|самые|обзор|путешест)',
+    re.IGNORECASE
+)
 
 
 def _is_banned(obj: dict) -> bool:
@@ -59,6 +63,19 @@ def _normalize_name(name: str) -> str:
 def _is_shown(name: str, shown: set) -> bool:
     norm = _normalize_name(name)
     return any(_normalize_name(s) == norm for s in shown)
+
+
+def _extract_address(text: str) -> str:
+    # Ищем паттерны адресов в тексте
+    patterns = [
+        r'(?:ул\.|улица|пер\.|переулок|пр\.|проспект|ш\.|шоссе|бул\.|бульвар|пл\.|площадь)\s+[\w\s]+,?\s*д\.?\s*\d+[\w/]*',
+        r'[\w\s]+ (?:ул\.|улица),?\s*\d+[\w/]*',
+    ]
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            return m.group(0).strip()
+    return ""
 
 
 def _extract_name(title: str) -> str:
@@ -115,16 +132,21 @@ async def _fetch_from_web(city: str) -> list:
                 continue
             if any(w in name.lower() for w in BANNED_WORDS):
                 continue
+            # Пропускаем статьи-списки и мусор
+            if JUNK_RE.search(name) or JUNK_RE.search(title):
+                continue
+            # Пропускаем если в тексте упоминается другой город (не тот что ищем)
+            if city.lower() not in content.lower() and city.lower() not in title.lower():
+                continue
 
-            # Описание — первые 250 символов контента
-            desc = re.sub(r'\s+', ' ', content).strip()[:250] if content else ""
-
+            desc = re.sub(r'\s+', ' ', content).strip()[:300] if content else ""
+            address = _extract_address(content)
             image = _extract_image(url, images[i:i+1] if i < len(images) else [])
 
             obj = {
                 "name": name,
                 "coords": "",
-                "address": "",
+                "address": address,
                 "description": desc,
                 "security": "",
                 "source_name": "Urban3P" if "urban3p" in url else "интернет",
