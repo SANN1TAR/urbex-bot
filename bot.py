@@ -87,20 +87,13 @@ def _format_obj(obj: dict) -> str:
     else:
         location = ""
 
-    date = obj.get("published_date", "")
-    date_line = f"\n📅 {date[:10]}" if date else ""
     security = obj.get("security", "")
-    sec_line = f"\n🔒 {security}" if security and security.lower() != "неизвестно" else ""
-    source = obj.get("source_name", "")
-    source_line = f"\n🔎 Источник: {source}" if source else ""
+    sec_line = f"\n🔒 {security}" if security and security.lower() not in ("неизвестно", "") else ""
 
     return (
         f"<b>{obj.get('name', 'Без названия')}</b>"
-        f"{location}\n\n"
-        f"{obj.get('description', '')}"
+        f"{location}"
         f"{sec_line}"
-        f"{date_line}"
-        f"{source_line}"
     )
 
 

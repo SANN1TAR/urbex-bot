@@ -102,10 +102,12 @@ def _extract_address(text: str) -> str:
 
 
 def _extract_name(title: str) -> str:
+    # Убираем суффикс после "/" (категория на urban3p: "Завод ЗиЛ / Заводы")
+    name = re.sub(r'\s*/\s*\w[\w\s]*$', '', title).strip()
     # Убираем суффиксы сайтов
     name = re.sub(
-        r'\s*[-|–|/]\s*(urban3p|urbantrip|urbact|заброшки|заброшенные|урбекс).*$',
-        '', title, flags=re.IGNORECASE
+        r'\s*[-–]\s*(urban3p|urbantrip|urbact|заброшки|заброшенные|урбекс).*$',
+        '', name, flags=re.IGNORECASE
     ).strip()
     # Убираем "Заброшенные объекты в ..."
     name = re.sub(r'^заброшенные объекты в\s+', '', name, flags=re.IGNORECASE).strip()
@@ -134,7 +136,7 @@ async def _fetch_from_web(city: str) -> list:
     seen_names = set()
 
     for source in SOURCES:
-        query = f"заброшка {city} {source}"
+        query = f"заброс заброшенная {city} {source}"
         try:
             data = await asyncio.to_thread(_tavily_search, query, True)
         except Exception as e:
