@@ -123,8 +123,27 @@ def _extract_image(images: list) -> str:
     return ""
 
 
+async def _get_coords_nominatim(name: str, city: str) -> str:
+    """Ищет координаты через Nominatim по названию объекта"""
+    query = f"{name}, {city}, Россия"
+    params = {"q": query, "format": "json", "limit": 1}
+    headers = {"User-Agent": "UrbexBot/1.0"}
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params=params, headers=headers
+            )
+            data = resp.json()
+            if data:
+                return f"{float(data[0]['lat']):.4f}, {float(data[0]['lon']):.4f}"
+    except Exception:
+        pass
+    return ""
+
+
 async def _scrape_object_page(url: str) -> dict:
-    """Парсит страницу объекта urban3p.ru — берёт OG фото и координаты"""
+    """Парсит страницу объекта urban3p.ru — берёт OG фото"""
     if not url or "urban3p" not in url:
         return {}
     try:
@@ -132,7 +151,7 @@ async def _scrape_object_page(url: str) -> dict:
             resp = await client.get(url, follow_redirects=True)
             if resp.status_code != 200:
                 return {}
-        html = resp.text
+            html = resp.text
 
         # Фото из og:image
         img = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
@@ -140,19 +159,23 @@ async def _scrape_object_page(url: str) -> dict:
             img = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html)
         image = img.group(1) if img else ""
 
-        # Координаты из Яндекс.Карт или других источников
-        coords = ""
-        lat_lon = re.search(r'["\s]lat[itude]*["\s]*[:=]["\s]*([5-7][0-9]\.[0-9]{3,6})["\s,]+["\s]?lon[gitude]*["\s]*[:=]["\s]*([3-6][0-9]\.[0-9]{3,6})', html, re.IGNORECASE)
-        if not lat_lon:
-            lat_lon = re.search(r'([5-7][0-9]\.[0-9]{4,6})[,\s]+([3-6][0-9]\.[0-9]{4,6})', html)
-        if lat_lon:
-            coords = f"{lat_lon.group(1)}, {lat_lon.group(2)}"
+        # Адрес из текста страницы
+        addr = re.search(r'(?:ул\.|улица|пер\.|проспект|пр-т|шоссе|бульвар|площадь)[^<]{3,50}', html, re.IGNORECASE)
+        address = re.sub(r'\s+', ' ', addr.group(0)).strip() if addr else ""
 
-        # Адрес
-        address = ""
-        addr = re.search(r'(?:ул\.|улица|пер\.|проспект|пр-т|шоссе|бульвар|площадь)[^<]{3,60}', html, re.IGNORECASE)
-        if addr:
-            address = re.sub(r'\s+', ' ', addr.group(0)).strip()
+        # Координаты через /onmap endpoint
+        coords = ""
+        obj_match = re.search(r'/object(\d+)', url)
+        if obj_match:
+            onmap_url = f"https://urban3p.ru/object{obj_match.group(1)}/onmap"
+            try:
+                async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "Mozilla/5.0"}) as client:
+                    r = await client.post(onmap_url, data={"submitted": "смотреть на карте"})
+                    lat_lon = re.search(r'([5-7][0-9]\.[0-9]{4,})[,\s]+([3-7][0-9]\.[0-9]{4,})', r.text)
+                    if lat_lon:
+                        coords = f"{lat_lon.group(1)}, {lat_lon.group(2)}"
+            except Exception:
+                pass
 
         logger.info(f"Парсинг {url}: фото={'да' if image else 'нет'}, coords={coords or 'нет'}")
         return {"image": image, "coords": coords, "address": address}
@@ -235,6 +258,8 @@ async def _fetch_from_web(city: str) -> list:
                 image = await asyncio.to_thread(_tavily_photo, name, city)
             if not coords:
                 coords = page_data.get("coords", "")
+            if not coords:
+                coords = await _get_coords_nominatim(name, city)
             if not address:
                 address = page_data.get("address", "")
 
