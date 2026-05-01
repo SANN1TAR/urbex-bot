@@ -65,6 +65,29 @@ def _is_shown(name: str, shown: set) -> bool:
     return any(_normalize_name(s) == norm for s in shown)
 
 
+def _is_valid_url(url: str) -> bool:
+    # Только страницы конкретных объектов, не категории и не регионы
+    if "urban3p" in url:
+        return bool(re.search(r'/object\d+', url))
+    return True
+
+
+def _is_valid_description(text: str) -> str:
+    # Убираем мусор — списки никнеймов, списки городов
+    if not text:
+        return ""
+    # Если текст выглядит как список никнеймов (много слов слитно без пробелов)
+    words = text.split()
+    if len(words) > 5:
+        avg_word_len = sum(len(w) for w in words) / len(words)
+        if avg_word_len > 10:  # длинные слитные слова = никнеймы или города слитно
+            return ""
+    # Убираем строки с перечислением регионов
+    if re.search(r'(область|край|округ).{0,20}(область|край|округ)', text):
+        return ""
+    return text.strip()
+
+
 def _extract_address(text: str) -> str:
     # Ищем паттерны адресов в тексте
     patterns = [
@@ -132,14 +155,24 @@ async def _fetch_from_web(city: str) -> list:
                 continue
             if any(w in name.lower() for w in BANNED_WORDS):
                 continue
+            # Только страницы конкретных объектов
+            if not _is_valid_url(url):
+                continue
             # Пропускаем статьи-списки и мусор
             if JUNK_RE.search(name) or JUNK_RE.search(title):
                 continue
-            # Пропускаем если в тексте упоминается другой город (не тот что ищем)
+            # Название не должно быть перечислением типов объектов
+            if name.count(",") >= 2:
+                continue
+            # Пропускаем если в тексте не упоминается нужный город
             if city.lower() not in content.lower() and city.lower() not in title.lower():
                 continue
 
-            desc = re.sub(r'\s+', ' ', content).strip()[:300] if content else ""
+            raw_desc = re.sub(r'\s+', ' ', content).strip()[:400] if content else ""
+            desc = _is_valid_description(raw_desc)
+            if not desc:
+                continue
+            desc = desc[:300]
             address = _extract_address(content)
             image = _extract_image(url, images[i:i+1] if i < len(images) else [])
 
