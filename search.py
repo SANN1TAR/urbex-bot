@@ -89,16 +89,24 @@ def _extract_address(text: str) -> str:
 
 
 async def _get_coords_nominatim(name: str, city: str) -> str:
+    # Убираем "заброшенный/заброшенная" и "(Город)" из названия
+    clean = re.sub(r'заброш\w+\s*', '', name, flags=re.IGNORECASE)
+    clean = re.sub(r'\([^)]*\)', '', clean).strip()
+    queries = [
+        f"{clean}, {city}, Россия",
+        f"{name}, {city}, Россия",
+    ]
     try:
         async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={"q": f"{name}, {city}, Россия", "format": "json", "limit": 1},
-                headers={"User-Agent": "UrbexBot/1.0"},
-            )
-            data = resp.json()
-            if data:
-                return f"{float(data[0]['lat']):.4f}, {float(data[0]['lon']):.4f}"
+            for q in queries:
+                resp = await client.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"q": q, "format": "json", "limit": 1},
+                    headers={"User-Agent": "UrbexBot/1.0"},
+                )
+                data = resp.json()
+                if data:
+                    return f"{float(data[0]['lat']):.4f}, {float(data[0]['lon']):.4f}"
     except Exception:
         pass
     return ""
