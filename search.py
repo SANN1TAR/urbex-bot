@@ -10,6 +10,7 @@ import random
 import re
 
 import httpx
+import overpy
 from groq import Groq
 from tavily import TavilyClient
 from dotenv import load_dotenv
@@ -103,49 +104,65 @@ async def _get_city_coords(city: str) -> tuple | None:
 OVERPASS_SERVERS = [
     "https://overpass-api.de/api/interpreter",
     "https://lz4.overpass-api.de/api/interpreter",
-    "https://z.overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 ]
 
 
-async def _overpass_search(lat: float, lon: float, radius: int = 20000) -> list:
-    q = (
-        f'[out:json][timeout:25];'
-        f'(way["abandoned"="yes"](around:{radius},{lat},{lon});'
-        f'way["disused"="yes"]["building"](around:{radius},{lat},{lon});'
-        f'way["ruins"="yes"]["building"](around:{radius},{lat},{lon});'
-        f'way["abandoned:building"](around:{radius},{lat},{lon});'
-        f'node["abandoned"="yes"](around:{radius},{lat},{lon}););'
-        f'out center tags;'
-    )
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "UrbexBot/1.0",
-    }
-    for server in OVERPASS_SERVERS:
+def _overpass_query_sync(lat: float, lon: float, radius: int) -> list:
+    q = f"""
+[out:json][timeout:25];
+(
+  way["abandoned:building"](around:{radius},{lat},{lon});
+  way["building"]["abandoned"="yes"](around:{radius},{lat},{lon});
+  way["ruins"="yes"]["building"](around:{radius},{lat},{lon});
+  node["abandoned:building"](around:{radius},{lat},{lon});
+  node["building"]["abandoned"="yes"](around:{radius},{lat},{lon});
+);
+out center tags;
+"""
+    for url in OVERPASS_SERVERS:
         try:
-            async with httpx.AsyncClient(timeout=35) as client:
-                resp = await client.post(server, data={"data": q}, headers=headers)
-                if resp.status_code != 200:
-                    logger.warning(f"Overpass {server}: HTTP {resp.status_code}")
-                    continue
-                elements = resp.json().get("elements", [])
-                logger.info(f"Overpass {server}: {len(elements)} объектов")
-                return elements
+            api = overpy.API(url=url)
+            result = api.query(q)
+            elements = []
+            for way in result.ways:
+                if way.center_lat and way.center_lon:
+                    elements.append({
+                        "type": "way",
+                        "id": way.id,
+                        "center": {"lat": float(way.center_lat), "lon": float(way.center_lon)},
+                        "tags": way.tags,
+                    })
+            for node in result.nodes:
+                elements.append({
+                    "type": "node",
+                    "id": node.id,
+                    "lat": float(node.lat),
+                    "lon": float(node.lon),
+                    "tags": node.tags,
+                })
+            logger.info(f"Overpass {url}: {len(elements)} объектов")
+            return elements
         except Exception as e:
-            logger.error(f"Overpass error ({server}): {e}")
+            logger.warning(f"Overpass {url}: {e}")
     return []
 
 
+async def _overpass_search(lat: float, lon: float, radius: int = 20000) -> list:
+    return await asyncio.to_thread(_overpass_query_sync, lat, lon, radius)
+
+
 def _osm_to_obj(element: dict) -> dict | None:
-    tags = element.get("tags", {})
+    tags = element.get("tags") or {}
+    if hasattr(tags, "get") is False:
+        tags = {}
 
     # Координаты
     if element.get("type") == "node":
         lat, lon = element.get("lat"), element.get("lon")
     else:
-        center = element.get("center", {})
+        center = element.get("center") or {}
         lat, lon = center.get("lat"), center.get("lon")
 
     if not lat or not lon:
