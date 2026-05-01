@@ -110,15 +110,14 @@ OVERPASS_SERVERS = [
 
 
 async def _overpass_search(lat: float, lon: float, radius: int = 20000) -> list:
-    # Короткий запрос без лишних пробелов
     q = (
-        f"[out:json][timeout:25];"
-        f"(way[abandoned=yes](around:{radius},{lat},{lon});"
-        f"way[disused=yes][building](around:{radius},{lat},{lon});"
-        f"way[ruins=yes][building](around:{radius},{lat},{lon});"
-        f"way[abandoned:building](around:{radius},{lat},{lon});"
-        f"node[abandoned=yes](around:{radius},{lat},{lon}););"
-        f"out center tags;"
+        f'[out:json][timeout:25];'
+        f'(way["abandoned"="yes"](around:{radius},{lat},{lon});'
+        f'way["disused"="yes"]["building"](around:{radius},{lat},{lon});'
+        f'way["ruins"="yes"]["building"](around:{radius},{lat},{lon});'
+        f'way["abandoned:building"](around:{radius},{lat},{lon});'
+        f'node["abandoned"="yes"](around:{radius},{lat},{lon}););'
+        f'out center tags;'
     )
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
