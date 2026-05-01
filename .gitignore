@@ -1,4 +1,47 @@
-.env
-urbex_bot.db
+# Security & credentials
+ide/
+statsig/
+telemetry/
+.credentials.json
+.mcp.json
+
+# User data (privacy)
+projects/
+projects-registry.json
+projects.md
+project-ideas.md
+backlog.md
+history.jsonl
+todos/
+plans/
+file-history/
+plugins/
+stats-cache.json
+
+# Session & runtime
+session-env/
+shell-snapshots/
+
+# Debug & cache
+debug/
+downloads/
+tmp/
+
+# System
+.DS_Store
+*.lock
+
+# Local settings
+settings.json
+settings.local.json
+# Allow project-level Claude settings (hooks, permissions)
+!.claude/settings.json
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# Bot secrets and generated files
+.env
+urbex_bot.db

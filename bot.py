@@ -1,5 +1,6 @@
 # Telegram-бот по поиску заброшенных объектов. Интерфейс: тиндер — по одному объекту.
 
+import asyncio
 import json
 import logging
 import os
@@ -356,5 +357,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
