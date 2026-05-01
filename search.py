@@ -37,8 +37,7 @@ BANNED_WORDS = {
 }
 
 SOURCES = [
-    "site:urban3p.ru",
-    "site:urban3p.com",
+    "site:urbantrip.ru",
 ]
 
 # Паттерны мусорных названий — статьи, топы, списки
@@ -149,7 +148,7 @@ async def _fetch_from_web(city: str) -> list:
                 "address": address,
                 "description": desc,
                 "security": "",
-                "source_name": "Urban3P" if "urban3p" in url else "интернет",
+                "source_name": "Urbantrip" if "urbantrip" in url else "Urban3P",
                 "image": image,
                 "published_date": r.get("published_date", ""),
             }
