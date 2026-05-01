@@ -1,6 +1,6 @@
-# Поиск заброшенных объектов через OpenStreetMap (Overpass API + Nominatim)
+# Поиск заброшенных объектов через urban3p.ru (Tavily) + кеш в SQLite
 # Получает: тип объекта (zabroshka), город, список уже показанных
-# Отдаёт: список объектов с реальными координатами/адресом из OSM, фото
+# Отдаёт: список объектов с названием, описанием, фото
 
 import asyncio
 import json
@@ -9,7 +9,6 @@ import os
 import random
 import re
 
-import httpx
 from groq import Groq
 from tavily import TavilyClient
 from dotenv import load_dotenv
@@ -25,46 +24,25 @@ groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 _counters: dict = {}
 
 BANNED_WORDS = {
-    # Небоскрёбы и бизнес-центры
     "москва-сити", "moscow city", "москва сити", "сити", "федерация",
-    "эволюция", "империя", "меркурий", "нафта", "око", "башня 2000",
-    "бизнес-центр", "бизнес центр", "офисный центр", "технопарк",
-    # Госучреждения и силовые структуры
-    "кремль", "мгу", "вднх", "лужники", "газпром", "фсб", "фсо", "минобороны",
-    "останкино", "останкинская", "большой театр", "гум", "цум",
-    "администрация", "мэрия", "правительство", "министерство", "прокуратура",
-    "полиция", "суд", "тюрьма", "следственный", "росгвардия",
-    # Действующие предприятия
+    "бизнес-центр", "бизнес центр", "офисный центр",
+    "кремль", "мгу", "вднх", "лужники", "газпром", "фсб", "фсо",
+    "останкино", "большой театр", "гум", "цум",
+    "администрация", "мэрия", "правительство", "министерство",
     "торговый центр", "торговый комплекс", "молл",
-    "гипермаркет", "супермаркет", "ресторан", "кафе", "отель", "гостиница",
-    # Парки и общественные пространства
-    "парк культуры", "ботанический", "зоопарк", "цирк", "стадион", "арена",
-    "музей", "галерея", "мемориал",
-    # Несуществующие объекты
-    "исторический слой", "исчезнувший", "невидимый объект",
+    "ресторан", "кафе", "отель", "гостиница",
+    "музей", "галерея", "мемориал", "стадион", "арена",
     "снесён", "снесено", "снесена",
-    # Не городские
-    "деревня", "сельское", "садовое товарищество", "снт ",
+    "деревня", "садовое товарищество",
 }
 
-BUILDING_TYPES = {
-    "industrial": "Заброшенный завод",
-    "warehouse": "Заброшенный склад",
-    "school": "Заброшенная школа",
-    "hospital": "Заброшенная больница",
-    "hotel": "Заброшенная гостиница",
-    "office": "Заброшенный офис",
-    "residential": "Заброшенный жилой дом",
-    "apartments": "Заброшенный жилой дом",
-    "church": "Заброшенная церковь",
-    "factory": "Заброшенная фабрика",
-    "dormitory": "Заброшенное общежитие",
-    "garage": "Заброшенные гаражи",
-    "manor": "Заброшенная усадьба",
-    "farm": "Заброшенная ферма",
-    "military": "Заброшенный военный объект",
-    "yes": "Заброшенное здание",
-}
+SOURCES = [
+    "site:urban3p.ru",
+    "site:urban3p.com",
+    "site:urbantrip.ru",
+    "site:urbact.ru",
+    "заброшка адрес урбекс",
+]
 
 
 def _is_banned(obj: dict) -> bool:
@@ -83,152 +61,91 @@ def _is_shown(name: str, shown: set) -> bool:
     return any(_normalize_name(s) == norm for s in shown)
 
 
-async def _get_city_coords(city: str) -> tuple | None:
-    params = {"q": f"{city}, Россия", "format": "json", "limit": 1}
-    headers = {"User-Agent": "UrbexTelegramBot/1.0"}
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                "https://nominatim.openstreetmap.org/search",
-                params=params, headers=headers,
-            )
-            data = resp.json()
-            if data:
-                return float(data[0]["lat"]), float(data[0]["lon"])
-    except Exception as e:
-        logger.error(f"Nominatim error: {e}")
-    return None
+def _extract_name(title: str) -> str:
+    # Убираем суффиксы сайтов
+    name = re.sub(
+        r'\s*[-|–|/]\s*(urban3p|urbantrip|urbact|заброшки|заброшенные|урбекс).*$',
+        '', title, flags=re.IGNORECASE
+    ).strip()
+    # Убираем "Заброшенные объекты в ..."
+    name = re.sub(r'^заброшенные объекты в\s+', '', name, flags=re.IGNORECASE).strip()
+    return name if len(name) > 3 else ""
 
 
-OVERPASS_SERVERS = [
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass.private.coffee/api/interpreter",
-    "https://overpass-api.de/api/interpreter",
-    "https://lz4.overpass-api.de/api/interpreter",
-]
+def _extract_image(url: str, images: list) -> str:
+    # Для urban3p.ru формируем URL превью по ID объекта
+    m = re.search(r'/object(\d+)', url)
+    if m:
+        return f"https://img04.urban3p.ru/up/o/{m.group(1)}/preview.jpg"
+    return images[0] if images else ""
 
 
-async def _overpass_search(city: str) -> list:
-    # Запрос через имя города — короткий и надёжный
-    q = (
-        f'[out:json][timeout:30];'
-        f'area["name"="{city}"]["admin_level"~"4|6"]->.a;'
-        f'(way["abandoned:building"](area.a);'
-        f'way["building"]["abandoned"="yes"](area.a);'
-        f'way["ruins"="yes"]["building"](area.a);'
-        f'node["abandoned:building"](area.a);'
-        f'node["building"]["abandoned"="yes"](area.a););'
-        f'out center tags;'
+def _tavily_search(query: str, images: bool = False) -> dict:
+    return tavily_client.search(
+        query,
+        max_results=10,
+        include_images=images,
+        search_depth="advanced",
     )
-    for server in OVERPASS_SERVERS:
+
+
+async def _fetch_from_web(city: str) -> list:
+    objects = []
+    seen_names = set()
+
+    for source in SOURCES:
+        query = f"заброшка {city} {source}"
         try:
-            async with httpx.AsyncClient(timeout=40) as client:
-                resp = await client.get(server, params={"data": q})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    elements = data.get("elements", [])
-                    logger.info(f"Overpass {server}: {len(elements)} объектов")
-                    return elements
-                logger.warning(f"Overpass {server}: HTTP {resp.status_code}")
+            data = await asyncio.to_thread(_tavily_search, query, True)
         except Exception as e:
-            logger.warning(f"Overpass {server}: {e}")
-    return []
+            logger.warning(f"Tavily error ({source}): {e}")
+            continue
 
+        results = data.get("results", [])
+        images = data.get("images", [])
+        logger.info(f"Источник '{source}': {len(results)} результатов")
 
-def _osm_to_obj(element: dict) -> dict | None:
-    tags = element.get("tags") or {}
-    if hasattr(tags, "get") is False:
-        tags = {}
+        for i, r in enumerate(results):
+            title = r.get("title", "")
+            url = r.get("url", "")
+            content = r.get("content", "")
 
-    # Координаты
-    if element.get("type") == "node":
-        lat, lon = element.get("lat"), element.get("lon")
-    else:
-        center = element.get("center") or {}
-        lat, lon = center.get("lat"), center.get("lon")
+            name = _extract_name(title)
+            if not name or _normalize_name(name) in seen_names:
+                continue
+            if any(w in name.lower() for w in BANNED_WORDS):
+                continue
 
-    if not lat or not lon:
-        return None
+            # Описание — первые 250 символов контента
+            desc = re.sub(r'\s+', ' ', content).strip()[:250] if content else ""
 
-    # Название
-    name = tags.get("name:ru") or tags.get("name") or tags.get("old_name:ru") or tags.get("old_name")
-    if not name:
-        btype = (
-            tags.get("abandoned:building") or
-            tags.get("building") or
-            tags.get("disused:building") or "yes"
-        )
-        name = BUILDING_TYPES.get(btype, "Заброшенное здание")
+            image = _extract_image(url, images[i:i+1] if i < len(images) else [])
 
-    # Адрес из OSM тегов — только реальные данные
-    addr_parts = []
-    if tags.get("addr:street"):
-        addr_parts.append(tags["addr:street"])
-    if tags.get("addr:housenumber"):
-        addr_parts.append(f"д. {tags['addr:housenumber']}")
-    address = ", ".join(addr_parts) if addr_parts else ""
+            obj = {
+                "name": name,
+                "coords": "",
+                "address": "",
+                "description": desc,
+                "security": "",
+                "source_name": "Urban3P" if "urban3p" in url else "интернет",
+                "image": image,
+                "published_date": r.get("published_date", ""),
+            }
 
-    # Описание
-    description = tags.get("description:ru") or tags.get("description") or ""
-    if not description:
-        btype = tags.get("building") or tags.get("abandoned:building") or ""
-        desc_type = BUILDING_TYPES.get(btype, "")
-        description = desc_type if desc_type and desc_type != name else "Заброшенный объект."
+            seen_names.add(_normalize_name(name))
+            objects.append(obj)
 
-    # Охрана
-    access = tags.get("access", "")
-    security = ""
-    if access == "no":
-        security = "Закрытая территория"
-    elif access == "private":
-        security = "Частная территория"
+        if len(objects) >= 20:
+            break
 
-    return {
-        "name": name,
-        "coords": f"{lat:.4f}, {lon:.4f}",
-        "address": address,
-        "description": description,
-        "security": security,
-        "source_name": "OpenStreetMap",
-        "image": "",
-        "published_date": "",
-    }
-
-
-async def _get_photo(name: str, city: str) -> str:
-    try:
-        r = await asyncio.to_thread(
-            lambda: tavily_client.search(
-                f"{name} {city} заброшка фото",
-                max_results=3,
-                include_images=True,
-            )
-        )
-        imgs = r.get("images", [])
-        return imgs[0] if imgs else ""
-    except Exception:
-        return ""
+    logger.info(f"Собрано объектов для {city}: {len(objects)}")
+    return objects
 
 
 async def _fetch_and_cache(city: str) -> int:
-    elements = await _overpass_search(city)
-    if not elements:
+    objects = await _fetch_from_web(city)
+    if not objects:
         return 0
-
-    objects = []
-    for el in elements:
-        obj = _osm_to_obj(el)
-        if obj and not _is_banned(obj):
-            osm_id = f"{el.get('type', '')}/{el.get('id', '')}"
-            obj["osm_id"] = osm_id
-            objects.append(obj)
-
-    logger.info(f"Найдено объектов для кеша: {len(objects)}")
-
-    # Добавляем фото только для первых 30 чтобы не перегружать Tavily
-    for obj in objects[:30]:
-        obj["image"] = await _get_photo(obj["name"], city)
-
     await save_objects(city, objects)
     return len(objects)
 
@@ -237,18 +154,15 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
     count = await get_city_count(city)
     age = await get_cache_age_days(city)
 
-    # Если кеш пустой или устарел — идём в Overpass
     if count == 0 or age > CACHE_TTL_DAYS:
         logger.info(f"Кеш для {city}: {count} объектов, возраст {age:.1f} дней — обновляем")
         fetched = await _fetch_and_cache(city)
         if fetched == 0:
             return []
     else:
-        logger.info(f"Кеш для {city}: {count} объектов, возраст {age:.1f} дней — берём из базы")
+        logger.info(f"Кеш для {city}: {count} объектов — берём из базы")
 
     objects = await get_objects(city, shown, limit=3)
-
-    # Если shown забил всё — берём без ограничений
     if not objects:
         objects = await get_objects(city, set(), limit=3)
 
@@ -256,53 +170,24 @@ async def search_objects(obj_type: str, city: str, shown: set) -> list:
 
 
 async def search_by_name(name: str, city: str) -> dict:
-    # Ищем в OSM по имени
-    coords = await _get_city_coords(city)
-    if coords:
-        lat, lon = coords
-        query = f"""
-[out:json][timeout:15];
-(
-  way["name"~"{name}",i](around:25000,{lat},{lon});
-  node["name"~"{name}",i](around:25000,{lat},{lon});
-  way["old_name"~"{name}",i](around:25000,{lat},{lon});
-);
-out center tags;
-"""
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.post(
-                    "https://overpass-api.de/api/interpreter",
-                    data={"data": query},
-                )
-                elements = resp.json().get("elements", [])
-                if elements:
-                    obj = _osm_to_obj(elements[0])
-                    if obj:
-                        obj["image"] = await _get_photo(name, city)
-                        return obj
-        except Exception as e:
-            logger.error(f"Overpass name search error: {e}")
-
-    # Fallback: Tavily + Groq
     try:
-        response = await asyncio.to_thread(
+        data = await asyncio.to_thread(
             lambda: tavily_client.search(
                 f"{name} {city} заброшка урбекс",
                 max_results=5,
                 include_images=True,
             )
         )
-        results = response.get("results", [])
-        images = response.get("images", [])
+        results = data.get("results", [])
+        images = data.get("images", [])
         if not results:
             return {"not_found": True}
 
-        data = "\n".join(f"- {r['title']}: {r['content']}" for r in results)
+        content = "\n".join(f"- {r['title']}: {r['content']}" for r in results)
         prompt = f"""Найди инфу об объекте "{name}" в {city}. Отвечай только на русском.
 
 Данные:
-{data}
+{content}
 
 JSON: {{"name":"...","coords":"...","address":"...","description":"..."}}
 Не найдено — верни: {{"not_found":true}}
@@ -320,7 +205,7 @@ JSON: {{"name":"...","coords":"...","address":"...","description":"..."}}
             text = parts[1][4:] if parts[1].startswith("json") else parts[1]
         result = json.loads(text.strip())
         if not result.get("not_found"):
-            result["image"] = images[0] if images else await _get_photo(name, city)
+            result["image"] = _extract_image(results[0].get("url", ""), images)
         return result
     except Exception:
         return {"not_found": True}
