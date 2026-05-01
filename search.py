@@ -9,6 +9,7 @@ import os
 import random
 import re
 
+import httpx
 from groq import Groq
 from tavily import TavilyClient
 from dotenv import load_dotenv
@@ -122,6 +123,44 @@ def _extract_image(images: list) -> str:
     return ""
 
 
+async def _scrape_object_page(url: str) -> dict:
+    """Парсит страницу объекта urban3p.ru — берёт OG фото и координаты"""
+    if not url or "urban3p" not in url:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            resp = await client.get(url, follow_redirects=True)
+            if resp.status_code != 200:
+                return {}
+        html = resp.text
+
+        # Фото из og:image
+        img = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
+        if not img:
+            img = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html)
+        image = img.group(1) if img else ""
+
+        # Координаты из Яндекс.Карт или других источников
+        coords = ""
+        lat_lon = re.search(r'["\s]lat[itude]*["\s]*[:=]["\s]*([5-7][0-9]\.[0-9]{3,6})["\s,]+["\s]?lon[gitude]*["\s]*[:=]["\s]*([3-6][0-9]\.[0-9]{3,6})', html, re.IGNORECASE)
+        if not lat_lon:
+            lat_lon = re.search(r'([5-7][0-9]\.[0-9]{4,6})[,\s]+([3-6][0-9]\.[0-9]{4,6})', html)
+        if lat_lon:
+            coords = f"{lat_lon.group(1)}, {lat_lon.group(2)}"
+
+        # Адрес
+        address = ""
+        addr = re.search(r'(?:ул\.|улица|пер\.|проспект|пр-т|шоссе|бульвар|площадь)[^<]{3,60}', html, re.IGNORECASE)
+        if addr:
+            address = re.sub(r'\s+', ' ', addr.group(0)).strip()
+
+        logger.info(f"Парсинг {url}: фото={'да' if image else 'нет'}, coords={coords or 'нет'}")
+        return {"image": image, "coords": coords, "address": address}
+    except Exception as e:
+        logger.warning(f"Scrape error {url}: {e}")
+        return {}
+
+
 def _tavily_search(query: str, images: bool = False) -> dict:
     return tavily_client.search(
         query,
@@ -189,14 +228,19 @@ async def _fetch_from_web(city: str) -> list:
                 continue
             desc = desc[:300]
             address = _extract_address(content)
-            image = _extract_image(images[i:i+1] if i < len(images) else [])
+            # Парсим страницу объекта — там OG фото и координаты
+            page_data = await _scrape_object_page(url)
+            image = page_data.get("image") or _extract_image(images[i:i+1] if i < len(images) else [])
             if not image:
                 image = await asyncio.to_thread(_tavily_photo, name, city)
-            logger.info(f"Фото для '{name}': {image[:60] if image else 'НЕТ'}")
+            if not coords:
+                coords = page_data.get("coords", "")
+            if not address:
+                address = page_data.get("address", "")
 
             obj = {
                 "name": name,
-                "coords": "",
+                "coords": coords,
                 "address": address,
                 "description": desc,
                 "security": "",
