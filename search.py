@@ -98,32 +98,42 @@ async def _get_city_coords(city: str) -> tuple | None:
     return None
 
 
+OVERPASS_SERVERS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+]
+
+
 async def _overpass_search(lat: float, lon: float, radius: int = 20000) -> list:
-    query = f"""
-[out:json][timeout:30];
-(
-  way["abandoned"="yes"](around:{radius},{lat},{lon});
-  way["disused"="yes"]["building"](around:{radius},{lat},{lon});
-  way["ruins"="yes"]["building"](around:{radius},{lat},{lon});
-  way["building:condition"="ruins"](around:{radius},{lat},{lon});
-  way["abandoned:building"](around:{radius},{lat},{lon});
-  node["abandoned"="yes"](around:{radius},{lat},{lon});
-  node["abandoned:building"](around:{radius},{lat},{lon});
-);
-out center tags;
-"""
-    try:
-        async with httpx.AsyncClient(timeout=35) as client:
-            resp = await client.post(
-                "https://overpass-api.de/api/interpreter",
-                data={"data": query},
-            )
-            elements = resp.json().get("elements", [])
-            logger.info(f"Overpass: {len(elements)} объектов найдено")
-            return elements
-    except Exception as e:
-        logger.error(f"Overpass error: {e}")
-        return []
+    query = (
+        f"[out:json][timeout:30];\n("
+        f'  way["abandoned"="yes"](around:{radius},{lat},{lon});'
+        f'  way["disused"="yes"]["building"](around:{radius},{lat},{lon});'
+        f'  way["ruins"="yes"]["building"](around:{radius},{lat},{lon});'
+        f'  way["building:condition"="ruins"](around:{radius},{lat},{lon});'
+        f'  way["abandoned:building"](around:{radius},{lat},{lon});'
+        f'  node["abandoned"="yes"](around:{radius},{lat},{lon});'
+        f'  node["abandoned:building"](around:{radius},{lat},{lon});'
+        f"\n);\nout center tags;"
+    )
+    for server in OVERPASS_SERVERS:
+        try:
+            async with httpx.AsyncClient(timeout=35) as client:
+                resp = await client.post(
+                    server,
+                    data={"data": query},
+                    headers={"Accept": "application/json"},
+                )
+                if resp.status_code != 200:
+                    logger.warning(f"Overpass {server}: HTTP {resp.status_code}")
+                    continue
+                elements = resp.json().get("elements", [])
+                logger.info(f"Overpass {server}: {len(elements)} объектов")
+                return elements
+        except Exception as e:
+            logger.error(f"Overpass error ({server}): {e}")
+    return []
 
 
 def _osm_to_obj(element: dict) -> dict | None:
