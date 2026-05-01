@@ -102,31 +102,32 @@ async def _get_city_coords(city: str) -> tuple | None:
 
 OVERPASS_SERVERS = [
     "https://overpass-api.de/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://z.overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
-    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
 ]
 
 
 async def _overpass_search(lat: float, lon: float, radius: int = 20000) -> list:
-    query = (
-        f"[out:json][timeout:30];\n("
-        f'  way["abandoned"="yes"](around:{radius},{lat},{lon});'
-        f'  way["disused"="yes"]["building"](around:{radius},{lat},{lon});'
-        f'  way["ruins"="yes"]["building"](around:{radius},{lat},{lon});'
-        f'  way["building:condition"="ruins"](around:{radius},{lat},{lon});'
-        f'  way["abandoned:building"](around:{radius},{lat},{lon});'
-        f'  node["abandoned"="yes"](around:{radius},{lat},{lon});'
-        f'  node["abandoned:building"](around:{radius},{lat},{lon});'
-        f"\n);\nout center tags;"
+    # Короткий запрос без лишних пробелов
+    q = (
+        f"[out:json][timeout:25];"
+        f"(way[abandoned=yes](around:{radius},{lat},{lon});"
+        f"way[disused=yes][building](around:{radius},{lat},{lon});"
+        f"way[ruins=yes][building](around:{radius},{lat},{lon});"
+        f"way[abandoned:building](around:{radius},{lat},{lon});"
+        f"node[abandoned=yes](around:{radius},{lat},{lon}););"
+        f"out center tags;"
     )
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "UrbexBot/1.0",
+    }
     for server in OVERPASS_SERVERS:
         try:
             async with httpx.AsyncClient(timeout=35) as client:
-                # Пробуем GET
-                resp = await client.get(server, params={"data": query})
-                if resp.status_code != 200:
-                    # Пробуем POST
-                    resp = await client.post(server, data={"data": query})
+                resp = await client.post(server, data={"data": q}, headers=headers)
                 if resp.status_code != 200:
                     logger.warning(f"Overpass {server}: HTTP {resp.status_code}")
                     continue
