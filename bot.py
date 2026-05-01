@@ -15,8 +15,8 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
-from database import get_user, init_db, save_user
-from search import search_by_name, search_objects, _counters
+from database import get_user, init_db, save_user, get_all_cached_cities, get_cache_age_days, CACHE_TTL_DAYS
+from search import search_by_name, search_objects, _fetch_and_cache, _counters
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -309,8 +309,20 @@ async def handle_search_query(message: Message, state: FSMContext):
     await message.answer(_format_obj(result), parse_mode="HTML", disable_web_page_preview=True)
 
 
+async def _refresh_cache_loop():
+    while True:
+        await asyncio.sleep(24 * 3600)
+        cities = await get_all_cached_cities()
+        for city in cities:
+            age = await get_cache_age_days(city)
+            if age > CACHE_TTL_DAYS:
+                logging.info(f"Фоновое обновление кеша: {city}")
+                await _fetch_and_cache(city)
+
+
 async def main():
     await init_db()
+    asyncio.create_task(_refresh_cache_loop())
     await dp.start_polling(bot)
 
 

@@ -14,6 +14,8 @@ from groq import Groq
 from tavily import TavilyClient
 from dotenv import load_dotenv
 
+from database import get_objects, save_objects, get_city_count, get_cache_age_days, CACHE_TTL_DAYS
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -209,41 +211,57 @@ async def _get_photo(name: str, city: str) -> str:
         return ""
 
 
-async def search_objects(obj_type: str, city: str, shown: set) -> list:
+async def _fetch_and_cache(city: str) -> int:
     coords = await _get_city_coords(city)
     if not coords:
         logger.warning(f"Координаты города не найдены: {city}")
-        return []
+        return 0
 
     lat, lon = coords
     logger.info(f"Город {city}: {lat:.4f}, {lon:.4f}")
 
     elements = await _overpass_search(lat, lon)
     if not elements:
-        return []
+        return 0
 
-    # Конвертируем и фильтруем
     objects = []
     for el in elements:
         obj = _osm_to_obj(el)
-        if obj and not _is_banned(obj) and not _is_shown(obj["name"], shown):
+        if obj and not _is_banned(obj):
+            osm_id = f"{el.get('type', '')}/{el.get('id', '')}"
+            obj["osm_id"] = osm_id
             objects.append(obj)
 
-    logger.info(f"После фильтрации: {len(objects)} объектов")
+    logger.info(f"Найдено объектов для кеша: {len(objects)}")
 
-    # Если всё отсеялось из-за shown — сбрасываем shown
-    if not objects:
-        objects = [o for o in (_osm_to_obj(el) for el in elements) if o and not _is_banned(o)]
-
-    if not objects:
-        return []
-
-    selected = random.sample(objects, min(3, len(objects)))
-
-    for obj in selected:
+    # Добавляем фото только для первых 30 чтобы не перегружать Tavily
+    for obj in objects[:30]:
         obj["image"] = await _get_photo(obj["name"], city)
 
-    return selected
+    await save_objects(city, objects)
+    return len(objects)
+
+
+async def search_objects(obj_type: str, city: str, shown: set) -> list:
+    count = await get_city_count(city)
+    age = await get_cache_age_days(city)
+
+    # Если кеш пустой или устарел — идём в Overpass
+    if count == 0 or age > CACHE_TTL_DAYS:
+        logger.info(f"Кеш для {city}: {count} объектов, возраст {age:.1f} дней — обновляем")
+        fetched = await _fetch_and_cache(city)
+        if fetched == 0:
+            return []
+    else:
+        logger.info(f"Кеш для {city}: {count} объектов, возраст {age:.1f} дней — берём из базы")
+
+    objects = await get_objects(city, shown, limit=3)
+
+    # Если shown забил всё — берём без ограничений
+    if not objects:
+        objects = await get_objects(city, set(), limit=3)
+
+    return objects
 
 
 async def search_by_name(name: str, city: str) -> dict:
