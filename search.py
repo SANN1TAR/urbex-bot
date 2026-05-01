@@ -251,13 +251,13 @@ async def _fetch_from_web(city: str) -> list:
                 continue
             desc = desc[:300]
             address = _extract_address(content)
+            coords = ""
             # Парсим страницу объекта — там OG фото и координаты
             page_data = await _scrape_object_page(url)
             image = page_data.get("image") or _extract_image(images[i:i+1] if i < len(images) else [])
             if not image:
                 image = await asyncio.to_thread(_tavily_photo, name, city)
-            if not coords:
-                coords = page_data.get("coords", "")
+            coords = page_data.get("coords", "")
             if not coords:
                 coords = await _get_coords_nominatim(name, city)
             if not address:
