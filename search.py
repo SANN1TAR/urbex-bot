@@ -115,13 +115,7 @@ def _extract_name(title: str) -> str:
     return title if len(title) > 3 else ""
 
 
-def _extract_image(url: str, images: list) -> str:
-    # Для urban3p.ru формируем URL превью по ID объекта
-    m = re.search(r'/object[s/]*(\d+)', url)
-    if m:
-        oid = m.group(1)
-        return f"https://img04.urban3p.ru/up/o/{oid}/preview.jpg"
-    # Берём первое изображение из поиска если есть
+def _extract_image(images: list) -> str:
     for img in images:
         if img and img.startswith("http"):
             return img
@@ -195,9 +189,10 @@ async def _fetch_from_web(city: str) -> list:
                 continue
             desc = desc[:300]
             address = _extract_address(content)
-            image = _extract_image(url, images[i:i+1] if i < len(images) else [])
+            image = _extract_image(images[i:i+1] if i < len(images) else [])
             if not image:
                 image = await asyncio.to_thread(_tavily_photo, name, city)
+            logger.info(f"Фото для '{name}': {image[:60] if image else 'НЕТ'}")
 
             obj = {
                 "name": name,
@@ -283,7 +278,7 @@ JSON: {{"name":"...","coords":"...","address":"...","description":"..."}}
             text = parts[1][4:] if parts[1].startswith("json") else parts[1]
         result = json.loads(text.strip())
         if not result.get("not_found"):
-            result["image"] = _extract_image(results[0].get("url", ""), images)
+            result["image"] = _extract_image(images)
         return result
     except Exception:
         return {"not_found": True}
