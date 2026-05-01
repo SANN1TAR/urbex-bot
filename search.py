@@ -137,6 +137,19 @@ def _tavily_search(query: str, images: bool = False) -> dict:
     )
 
 
+def _tavily_photo(name: str, city: str) -> str:
+    try:
+        r = tavily_client.search(
+            f"{name} {city} заброшка фото",
+            max_results=3,
+            include_images=True,
+        )
+        imgs = r.get("images", [])
+        return imgs[0] if imgs else ""
+    except Exception:
+        return ""
+
+
 async def _fetch_from_web(city: str) -> list:
     objects = []
     seen_names = set()
@@ -183,6 +196,8 @@ async def _fetch_from_web(city: str) -> list:
             desc = desc[:300]
             address = _extract_address(content)
             image = _extract_image(url, images[i:i+1] if i < len(images) else [])
+            if not image:
+                image = await asyncio.to_thread(_tavily_photo, name, city)
 
             obj = {
                 "name": name,
