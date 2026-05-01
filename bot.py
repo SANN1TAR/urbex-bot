@@ -5,7 +5,7 @@ import logging
 import os
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -127,6 +127,39 @@ async def cmd_start(message: Message, state: FSMContext):
             reply_markup=ReplyKeyboardRemove(),
         )
         await state.set_state(Reg.city)
+
+
+HELP_TEXT = """
+<b>🏚 Как пользоваться ботом</b>
+
+<b>Кнопки:</b>
+🏚️ <b>Заброшка</b> — найти заброшенные объекты в твоём городе. Первый поиск занимает ~10 сек, потом мгновенно.
+➡️ <b>Следующий</b> — показать другой объект
+🔄 <b>Заново</b> — начать с начала, сбросить показанные
+🔍 <b>Поиск по названию</b> — найти конкретный объект, напиши название
+🏙️ <b>Сменить город</b> — изменить город поиска
+
+<b>Команды:</b>
+/start — начало работы
+/restart — сброс и обновление базы объектов для твоего города
+/help — это сообщение
+
+<b>Почему нет адреса или координат?</b>
+Не все объекты есть в открытых источниках с точным адресом. Если адреса нет — попробуй найти объект вручную по названию в Яндексе или 2ГИС.
+
+<b>Почему нет фото?</b>
+Иногда фото не удаётся найти автоматически. Нажми "Следующий" — у других объектов фото есть.
+
+<b>Пишет "Попробуй позже"?</b>
+Нажми /restart — это сбросит кеш и найдёт объекты заново.
+
+<b>⚠️ Важно:</b> вся информация из открытых источников и может быть устаревшей. Перед выездом проверяй сам.
+"""
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(HELP_TEXT, parse_mode="HTML")
 
 
 @dp.message(Command("restart"))
