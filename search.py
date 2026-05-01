@@ -122,11 +122,11 @@ async def _overpass_search(lat: float, lon: float, radius: int = 20000) -> list:
     for server in OVERPASS_SERVERS:
         try:
             async with httpx.AsyncClient(timeout=35) as client:
-                resp = await client.post(
-                    server,
-                    data={"data": query},
-                    headers={"Accept": "application/json"},
-                )
+                # Пробуем GET
+                resp = await client.get(server, params={"data": query})
+                if resp.status_code != 200:
+                    # Пробуем POST
+                    resp = await client.post(server, data={"data": query})
                 if resp.status_code != 200:
                     logger.warning(f"Overpass {server}: HTTP {resp.status_code}")
                     continue
