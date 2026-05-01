@@ -142,6 +142,12 @@ async def get_cache_age_days(city: str) -> float:
     return 999.0
 
 
+async def clear_city_cache(city: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM objects WHERE city = ?", (city,))
+        await db.commit()
+
+
 async def get_all_cached_cities() -> list:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(

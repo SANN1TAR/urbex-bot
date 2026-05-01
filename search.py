@@ -102,24 +102,30 @@ def _extract_address(text: str) -> str:
 
 
 def _extract_name(title: str) -> str:
-    # Убираем суффикс после "/" (категория на urban3p: "Завод ЗиЛ / Заводы")
-    name = re.sub(r'\s*/\s*\w[\w\s]*$', '', title).strip()
-    # Убираем суффиксы сайтов
-    name = re.sub(
+    # Убираем суффикс категории: "Завод ЗиЛ (Москва) / Заводы" → "Завод ЗиЛ (Москва)"
+    if '/' in title:
+        title = title.split('/')[0].strip()
+    # Убираем суффиксы сайтов после тире
+    title = re.sub(
         r'\s*[-–]\s*(urban3p|urbantrip|urbact|заброшки|заброшенные|урбекс).*$',
-        '', name, flags=re.IGNORECASE
+        '', title, flags=re.IGNORECASE
     ).strip()
     # Убираем "Заброшенные объекты в ..."
-    name = re.sub(r'^заброшенные объекты в\s+', '', name, flags=re.IGNORECASE).strip()
-    return name if len(name) > 3 else ""
+    title = re.sub(r'^заброшенные объекты в\s+', '', title, flags=re.IGNORECASE).strip()
+    return title if len(title) > 3 else ""
 
 
 def _extract_image(url: str, images: list) -> str:
     # Для urban3p.ru формируем URL превью по ID объекта
-    m = re.search(r'/object(\d+)', url)
+    m = re.search(r'/object[s/]*(\d+)', url)
     if m:
-        return f"https://img04.urban3p.ru/up/o/{m.group(1)}/preview.jpg"
-    return images[0] if images else ""
+        oid = m.group(1)
+        return f"https://img04.urban3p.ru/up/o/{oid}/preview.jpg"
+    # Берём первое изображение из поиска если есть
+    for img in images:
+        if img and img.startswith("http"):
+            return img
+    return ""
 
 
 def _tavily_search(query: str, images: bool = False) -> dict:

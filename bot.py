@@ -15,7 +15,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
-from database import get_user, init_db, save_user, get_all_cached_cities, get_cache_age_days, CACHE_TTL_DAYS
+from database import get_user, init_db, save_user, get_all_cached_cities, get_cache_age_days, CACHE_TTL_DAYS, clear_city_cache
 from search import search_by_name, search_objects, _fetch_and_cache, _counters
 
 load_dotenv()
@@ -135,6 +135,9 @@ async def cmd_restart(message: Message, state: FSMContext):
     _shown_global.pop(uid, None)
     _counters.clear()
     await state.clear()
+    user = await get_user(uid)
+    if user:
+        await clear_city_cache(user["city"])
     await message.answer("Перезагрузил. Всё с нуля — поехали.", reply_markup=MAIN_KB)
 
 
