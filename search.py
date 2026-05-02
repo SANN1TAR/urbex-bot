@@ -62,6 +62,8 @@ def _extract_name(title: str) -> str:
         '', title, flags=re.IGNORECASE
     ).strip()
     title = re.sub(r'^заброшенные объекты в\s+', '', title, flags=re.IGNORECASE).strip()
+    # Remove city name in parentheses at end: "Название (Москва)" → "Название"
+    title = re.sub(r'\s*\([^)]{2,20}\)\s*$', '', title).strip()
     return title if len(title) > 3 else ""
 
 
@@ -184,13 +186,14 @@ async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
 
     objects = []
     seen_names: set[str] = set()
+    seen_coords: set[tuple[float, float]] = set()  # in-batch coord dedup
 
     for source in SOURCES:
         try:
             data = await asyncio.to_thread(
                 lambda s=source: _tavily_client.search(
                     f"заброшенная {city} {s}",
-                    max_results=10,
+                    max_results=20,
                     include_images=True,
                     search_depth="advanced",
                 )
@@ -248,7 +251,15 @@ async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
                 logger.info(f"Skipping '{name}' — no location data")
                 continue
 
-            # Coordinate deduplication
+            # In-batch coordinate dedup (same fetch run)
+            if lat is not None and lon is not None:
+                coord_key = (round(lat, 3), round(lon, 3))
+                if coord_key in seen_coords:
+                    logger.info(f"Skipping '{name}' — in-batch duplicate coords")
+                    continue
+                seen_coords.add(coord_key)
+
+            # DB coordinate deduplication
             if await is_duplicate(pool, city, lat, lon):
                 logger.info(f"Skipping '{name}' — duplicate within 100m")
                 continue
