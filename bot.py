@@ -1,12 +1,11 @@
-# Telegram-бот по поиску заброшенных объектов. Интерфейс: тиндер — по одному объекту.
-
 import asyncio
 import json
 import logging
-import os
+import time
 
+import asyncpg
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command, CommandObject
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -14,18 +13,20 @@ from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
     KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
 )
-from dotenv import load_dotenv
 
-from database import get_user, init_db, save_user, get_all_cached_cities, get_cache_age_days, CACHE_TTL_DAYS, clear_city_cache
-from search import search_by_name, search_objects, _fetch_and_cache, _counters
+from config import get_config
+from database import get_user, init_db, save_user
+from search import search_objects, init_search
 
-load_dotenv()
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
-dp = Dispatcher(storage=MemoryStorage())
+# Module-level pool — set in main()
+_pool: asyncpg.Pool | None = None
 
-_shown_global: dict[int, set] = {}
+# In-memory shown tracking: uid → set of object IDs (integers)
+_shown_global: dict[int, set[int]] = {}
+_shown_timestamps: dict[int, float] = {}  # uid → last active timestamp
 
 DISCLAIMER = (
     "⚠️ <b>Стоп, читай сюда.</b>\n\n"
@@ -46,7 +47,7 @@ STALE_NOTE = "⚡ Не серчай, инфа может быть устарев
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🏚️ Заброшка")],
-        [KeyboardButton(text="🔍 Поиск по названию"), KeyboardButton(text="🏙️ Сменить город")],
+        [KeyboardButton(text="🏙️ Сменить город")],
     ],
     resize_keyboard=True,
 )
@@ -56,7 +57,7 @@ NAV_KB = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="🔄 Заново", callback_data="restart"),
 ]])
 
-MENU_BUTTONS = {"🏚️ Заброшка", "🔍 Поиск по названию", "🏙️ Сменить город"}
+MENU_BUTTONS = {"🏚️ Заброшка", "🏙️ Сменить город"}
 OBJ_TYPE_NAMES = {"zabroshka": "заброшки"}
 
 CITY_ALIASES = {
@@ -71,7 +72,11 @@ CITY_ALIASES = {
     "вгд": "Волгоград", "пермь": "Пермь",
     "алм": "Алматы", "алматы": "Алматы", "алма-ата": "Алматы",
     "аст": "Астана", "астана": "Астана", "нур": "Астана",
+    "мо": "Московская область", "подмосковье": "Московская область",
+    "московская область": "Московская область",
 }
+
+dp = Dispatcher(storage=MemoryStorage())
 
 
 def _resolve_city(raw: str) -> str:
@@ -79,41 +84,72 @@ def _resolve_city(raw: str) -> str:
 
 
 def _format_obj(obj: dict) -> str:
-    coords = obj.get("coords", "")
+    lat = obj.get("lat")
+    lon = obj.get("lon")
     address = obj.get("address", "")
-    if coords:
-        location = f"\n🗺 {coords}"
+    if lat is not None and lon is not None:
+        location = f"\n🗺 {lat:.4f}, {lon:.4f}"
     elif address:
         location = f"\n📍 {address}"
     else:
         location = ""
+    return f"<b>{obj.get('name', 'Без названия')}</b>{location}"
 
-    security = obj.get("security", "")
-    sec_line = f"\n🔒 {security}" if security and security.lower() not in ("неизвестно", "") else ""
 
-    return (
-        f"<b>{obj.get('name', 'Без названия')}</b>"
-        f"{location}"
-        f"{sec_line}"
-    )
+def _cleanup_shown() -> None:
+    """Remove shown entries inactive for more than 24 hours."""
+    cutoff = time.time() - 86400
+    stale = [uid for uid, ts in _shown_timestamps.items() if ts < cutoff]
+    for uid in stale:
+        _shown_global.pop(uid, None)
+        _shown_timestamps.pop(uid, None)
+    if stale:
+        logger.info(f"Cleaned up shown history for {len(stale)} inactive users")
 
 
 class Reg(StatesGroup):
     city = State()
 
 
-class Search(StatesGroup):
-    query = State()
-
-
 class Browsing(StatesGroup):
     active = State()
+
+
+async def _require_user(message: Message) -> dict | None:
+    user = await get_user(_pool, message.from_user.id)
+    if not user:
+        await message.answer("Сначала зарегистрируйся — напиши /start")
+    return user
+
+
+HELP_TEXT = """
+<b>🏚 Как пользоваться ботом</b>
+
+<b>Кнопки:</b>
+🏚️ <b>Заброшка</b> — найти заброшенные объекты в твоём городе. Первый поиск занимает ~15 сек, потом быстрее.
+➡️ <b>Следующий</b> — показать другой объект
+🔄 <b>Заново</b> — начать с начала, сбросить показанные
+🏙️ <b>Сменить город</b> — изменить город поиска
+
+<b>Команды:</b>
+/start — начало работы
+/restart — сброс и поиск новых объектов
+/help — это сообщение
+
+<b>Почему нет адреса или координат?</b>
+Не у всех объектов есть публичные координаты. Если локации нет — такой объект бот не показывает.
+
+<b>Пишет "Попробуй позже"?</b>
+Нажми /restart — это запустит новый поиск объектов.
+
+<b>⚠️ Важно:</b> вся информация из открытых источников и может быть устаревшей. Перед выездом проверяй сам.
+"""
 
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    user = await get_user(message.from_user.id)
+    user = await get_user(_pool, message.from_user.id)
     if user:
         await message.answer(
             f"О, вернулся. Город {user['city']} — поехали, чё надо?",
@@ -123,39 +159,10 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(DISCLAIMER, parse_mode="HTML")
         await message.answer(
             "Здорово, ёпта. Я тут из рода экскурсоводов — знаю почти все дыры в городе.\n\n"
-            "Знаю заброшенные объекты почти в каждом городе.\n\n"
-            "Из какого ты города? Пиши как угодно — МСК, ЕКБ, Питер, полное название.",
+            "Из какого ты города? Пиши как угодно — МСК, МО, Питер, полное название.",
             reply_markup=ReplyKeyboardRemove(),
         )
         await state.set_state(Reg.city)
-
-
-HELP_TEXT = """
-<b>🏚 Как пользоваться ботом</b>
-
-<b>Кнопки:</b>
-🏚️ <b>Заброшка</b> — найти заброшенные объекты в твоём городе. Первый поиск занимает ~10 сек, потом мгновенно.
-➡️ <b>Следующий</b> — показать другой объект
-🔄 <b>Заново</b> — начать с начала, сбросить показанные
-🔍 <b>Поиск по названию</b> — найти конкретный объект, напиши название
-🏙️ <b>Сменить город</b> — изменить город поиска
-
-<b>Команды:</b>
-/start — начало работы
-/restart — сброс и обновление базы объектов для твоего города
-/help — это сообщение
-
-<b>Почему нет адреса или координат?</b>
-Не все объекты есть в открытых источниках с точным адресом. Если адреса нет — попробуй найти объект вручную по названию в Яндексе или 2ГИС.
-
-<b>Почему нет фото?</b>
-Иногда фото не удаётся найти автоматически. Нажми "Следующий" — у других объектов фото есть.
-
-<b>Пишет "Попробуй позже"?</b>
-Нажми /restart — это сбросит кеш и найдёт объекты заново.
-
-<b>⚠️ Важно:</b> вся информация из открытых источников и может быть устаревшей. Перед выездом проверяй сам.
-"""
 
 
 @dp.message(Command("help"))
@@ -167,12 +174,9 @@ async def cmd_help(message: Message):
 async def cmd_restart(message: Message, state: FSMContext):
     uid = message.from_user.id
     _shown_global.pop(uid, None)
-    _counters.clear()
+    _shown_timestamps.pop(uid, None)
     await state.clear()
-    user = await get_user(uid)
-    if user:
-        await clear_city_cache(user["city"])
-    await message.answer("Перезагрузил. Всё с нуля — поехали.", reply_markup=MAIN_KB)
+    await message.answer("Перезагрузил. Ищу заново — поехали.", reply_markup=MAIN_KB)
 
 
 @dp.message(Reg.city)
@@ -181,7 +185,7 @@ async def reg_city(message: Message, state: FSMContext):
         await message.answer("Сначала напиши город:", reply_markup=ReplyKeyboardRemove())
         return
     city = _resolve_city(message.text)
-    await save_user(message.from_user.id, city)
+    await save_user(_pool, message.from_user.id, city)
     await state.clear()
     await message.answer(VPN_NOTE, parse_mode="HTML")
     await message.answer(f"{city} — знаю там пару мест. Чё ищешь?", reply_markup=MAIN_KB)
@@ -192,31 +196,37 @@ async def _send_one(message: Message, obj: dict):
     if image:
         try:
             await message.answer_photo(photo=image)
-        except Exception:
-            pass
-    await message.answer(
-        _format_obj(obj),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        reply_markup=NAV_KB,
-    )
-    await message.answer(STALE_NOTE)
+        except Exception as e:
+            logger.debug(f"Failed to send photo {image[:50]}: {e}")
+    try:
+        await message.answer(
+            _format_obj(obj),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=NAV_KB,
+        )
+        await message.answer(STALE_NOTE)
+    except Exception as e:
+        logger.error(f"Failed to send object card: {e}")
 
 
 async def start_browsing(message: Message, state: FSMContext, obj_type: str, city: str):
+    _cleanup_shown()
     uid = message.from_user.id
-    shown = _shown_global.get(uid, set())
+    shown_ids = _shown_global.get(uid, set())
 
     await message.answer(f"Ща пробью {OBJ_TYPE_NAMES[obj_type]} в {city}... 🔍")
-    objects = await search_objects(obj_type, city, shown)
+    objects = await search_objects(_pool, obj_type, city, shown_ids)
 
     if not objects:
+        await state.clear()
         await message.answer("Попробуй позже или смени город.", reply_markup=MAIN_KB)
         return
 
-    new_names = {o.get("name", "") for o in objects}
-    combined = shown | new_names
-    _shown_global[uid] = combined if len(combined) <= 30 else new_names
+    new_ids = {o["id"] for o in objects}
+    combined = shown_ids | new_ids
+    _shown_global[uid] = combined if len(combined) <= 50 else new_ids
+    _shown_timestamps[uid] = time.time()
 
     await state.set_state(Browsing.active)
     await state.update_data(
@@ -246,18 +256,19 @@ async def handle_next(callback: CallbackQuery, state: FSMContext):
         return
 
     uid = callback.from_user.id
-    shown = _shown_global.get(uid, set())
+    shown_ids = _shown_global.get(uid, set())
     await callback.message.answer("Ищу ещё... 🔍")
-    objects = await search_objects(data["obj_type"], data["city"], shown)
+    objects = await search_objects(_pool, data["obj_type"], data["city"], shown_ids)
 
     if not objects:
-        await callback.message.answer("Попробуй позже или смени город.", reply_markup=MAIN_KB)
         await state.clear()
+        await callback.message.answer("Попробуй позже или смени город.", reply_markup=MAIN_KB)
         return
 
-    new_names = {o.get("name", "") for o in objects}
-    combined = shown | new_names
-    _shown_global[uid] = combined if len(combined) <= 30 else new_names
+    new_ids = {o["id"] for o in objects}
+    combined = shown_ids | new_ids
+    _shown_global[uid] = combined if len(combined) <= 50 else new_ids
+    _shown_timestamps[uid] = time.time()
 
     await state.update_data(
         cache=json.dumps([dict(o) for o in objects], ensure_ascii=False),
@@ -277,15 +288,9 @@ async def handle_restart(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     uid = callback.from_user.id
     _shown_global.pop(uid, None)
+    _shown_timestamps.pop(uid, None)
     await state.clear()
     await start_browsing(callback.message, state, data["obj_type"], data["city"])
-
-
-async def _require_user(message: Message):
-    user = await get_user(message.from_user.id)
-    if not user:
-        await message.answer("Сначала зарегистрируйся — напиши /start")
-    return user
 
 
 @dp.message(F.text == "🏚️ Заброшка")
@@ -304,56 +309,42 @@ async def handle_change_city(message: Message, state: FSMContext):
     await state.set_state(Reg.city)
 
 
-@dp.message(F.text == "🔍 Поиск по названию")
-async def handle_search_prompt(message: Message, state: FSMContext):
-    user = await _require_user(message)
-    if not user:
-        return
-    await state.clear()
-    await message.answer("Называй объект, пробью что знаю:")
-    await state.set_state(Search.query)
-
-
-@dp.message(Search.query)
-async def handle_search_query(message: Message, state: FSMContext):
-    if message.text in MENU_BUTTONS:
-        await state.clear()
-        await message.answer("Выбирай:", reply_markup=MAIN_KB)
-        return
-    query = message.text.strip()
-    await state.clear()
-    user = await get_user(message.from_user.id)
-    await message.answer(f"Пробиваю '{query}'...")
-
-    result = await search_by_name(query, user["city"])
-    if not result or result.get("not_found"):
-        await message.answer(f"Не нашёл ничего по '{query}'.")
-        return
-
-    image = result.get("image", "")
-    if image:
-        try:
-            await message.answer_photo(photo=image)
-        except Exception:
-            pass
-    await message.answer(_format_obj(result), parse_mode="HTML", disable_web_page_preview=True)
-
-
-async def _refresh_cache_loop():
+async def _refresh_cache_loop(pool: asyncpg.Pool) -> None:
     while True:
-        await asyncio.sleep(24 * 3600)
-        cities = await get_all_cached_cities()
-        for city in cities:
-            age = await get_cache_age_days(city)
-            if age > CACHE_TTL_DAYS:
-                logging.info(f"Фоновое обновление кеша: {city}")
-                await _fetch_and_cache(city)
+        try:
+            await asyncio.sleep(24 * 3600)
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("SELECT DISTINCT city FROM users")
+            cities = [r["city"] for r in rows]
+            for city in cities:
+                try:
+                    logger.info(f"Background refresh for {city}")
+                    await search_objects(pool, "zabroshka", city, set())
+                except Exception as e:
+                    logger.error(f"Background refresh failed for {city}: {e}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Cache refresh loop error: {e}")
 
 
 async def main():
-    await init_db()
-    asyncio.create_task(_refresh_cache_loop())
-    await dp.start_polling(bot)
+    global _pool
+    cfg = get_config()
+    init_search(cfg.tavily_api_key)
+    _pool = await asyncpg.create_pool(cfg.database_url, min_size=2, max_size=10)
+    await init_db(_pool)
+    bot = Bot(token=cfg.telegram_token)
+    task = asyncio.create_task(_refresh_cache_loop(_pool))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        await _pool.close()
 
 
 if __name__ == "__main__":

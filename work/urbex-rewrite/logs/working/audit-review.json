@@ -1,0 +1,55 @@
+{
+  "status": "changes_required",
+  "findings": [
+    {
+      "severity": "major",
+      "file": "bot.py",
+      "line": 18,
+      "issue": "get_objects is imported from database but never called anywhere in bot.py. All calls to get_objects happen internally inside search.py via search_objects(). This import is dead code.",
+      "fix": "Remove get_objects from the import line: change 'from database import get_user, init_db, save_user, get_objects' to 'from database import get_user, init_db, save_user'"
+    },
+    {
+      "severity": "major",
+      "file": "bot.py",
+      "line": 313,
+      "issue": "_refresh_cache_loop re-imports update_city_fetched from database inside the function body, but update_city_fetched is never actually called inside this function. The loop delegates to search_objects() which calls update_city_fetched internally. The local import is entirely unused.",
+      "fix": "Remove 'from database import get_city_last_fetched, update_city_fetched, CACHE_REFRESH_DAYS' from inside _refresh_cache_loop. Keep only 'from datetime import datetime, timezone' if that import is truly needed (it is used on line 325), or restructure to use module-level imports."
+    },
+    {
+      "severity": "major",
+      "file": "bot.py",
+      "line": 313,
+      "issue": "_refresh_cache_loop imports 'from datetime import datetime, timezone' inside the function body. datetime and timezone are standard library; importing them inside a hot loop (runs every 24h) is acceptable but inconsistent with Python conventions. More importantly, get_city_last_fetched and CACHE_REFRESH_DAYS are imported locally but search_objects already handles the refresh-check logic internally — the loop is duplicating the staleness check.",
+      "fix": "Move 'from datetime import datetime, timezone' to module-level imports at the top of bot.py. Remove the entire local 'from database import ...' import inside _refresh_cache_loop since the staleness check there is redundant: search_objects() already performs the same check internally. Simplify the loop to just call search_objects(pool, 'zabroshka', city, set()) for each city without the pre-check."
+    },
+    {
+      "severity": "minor",
+      "file": "search.py",
+      "line": 169,
+      "issue": "Tavily query string contains 'заброс' which is a truncated/misspelled word (likely meant 'заброшен' or simply redundant next to 'заброшенная'). This may degrade search quality.",
+      "fix": "Change query to 'заброшенная {city} {source}' — remove 'заброс' prefix, or correct to 'заброшен заброшенная {city} {source}' if both forms are desired."
+    },
+    {
+      "severity": "minor",
+      "file": "database.py",
+      "line": 118,
+      "issue": "save_objects compares asyncpg execute() result with the string 'INSERT 0 1' to count saved rows. This is correct for asyncpg (returns command tag string), but it is fragile and undocumented behavior. Future asyncpg versions or different PostgreSQL configurations could change the command tag format.",
+      "fix": "Document with a comment: '# asyncpg returns command tag string, e.g. \"INSERT 0 1\" for one inserted row'. Alternatively, use a more robust check: 'if result.startswith(\"INSERT\") and result.endswith(\" 1\"): saved += 1' to handle any OID value in position 2."
+    },
+    {
+      "severity": "minor",
+      "file": "bot.py",
+      "line": 25,
+      "issue": "_pool is initialized to None at module level and used in handlers without None guard. While safe in practice (handlers only fire after dp.start_polling() which runs after _pool is set in main()), there is no explicit guard. A misuse or test importing bot.py and calling a handler directly would crash with AttributeError on pool.acquire().",
+      "fix": "Add a guard in _require_user and/or start_browsing: 'if _pool is None: raise RuntimeError(\"Pool not initialized\")'. Or add an assertion at the top of main() handlers. Low priority given the startup order guarantees safety."
+    },
+    {
+      "severity": "minor",
+      "file": "search.py",
+      "line": 167,
+      "issue": "Lambda inside asyncio.to_thread captures _tavily_client from the enclosing scope at call time. The None check on line 159 guards against calling _fetch_from_web before init_search(), but if init_search() is called and then _tavily_client is set back to None (theoretically possible if init_search is called again with invalid key), the lambda would crash inside a thread with an unclear error.",
+      "fix": "Capture the client reference explicitly: 'client = _tavily_client' before the loop, then use 'client' inside the lambda. This makes the None-check fully reliable and the captured value immutable for the duration of the call."
+    }
+  ],
+  "summary": "Overall the rewrite is well-structured and all critical requirements from the tech-spec are met: groq/aiosqlite/sqlite3 are fully removed, asyncpg pool is properly created and passed, init_search() is correctly called before bot starts, all function signatures match between caller and callee, the save_objects INSERT command tag comparison is technically correct for asyncpg, and _tavily_client has a proper None guard. Two major issues require fixes before deploy: (1) dead import of get_objects in bot.py, and (2) dead re-import block inside _refresh_cache_loop that imports update_city_fetched but never uses it. These are code quality issues that won't cause runtime crashes but indicate leftover scaffolding that should be cleaned up. Three minor issues: a typo in the Tavily query string, fragile asyncpg command tag string comparison, and the unguarded _pool usage pattern."
+}

@@ -1,157 +1,158 @@
-# Работа с базой данных: пользователи + кеш заброшенных объектов по городам
-# Получает: telegram_id, город, объекты
-# Отдаёт: данные пользователя, список объектов для города
-
-import json
-import aiosqlite
-
-DB_PATH = "urbex_bot.db"
-CACHE_TTL_DAYS = 7
+import asyncpg
+from datetime import datetime, timezone
 
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id INTEGER PRIMARY KEY,
-                city TEXT NOT NULL,
-                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CACHE_REFRESH_DAYS = 7
+
+
+async def init_db(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cities (
+                name TEXT PRIMARY KEY,
+                last_fetched_at TIMESTAMP WITH TIME ZONE
             )
         """)
-        await db.execute("""
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id BIGINT PRIMARY KEY,
+                city        TEXT NOT NULL,
+                registered_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS objects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                city TEXT NOT NULL,
-                osm_id TEXT,
-                name TEXT NOT NULL,
-                coords TEXT,
-                address TEXT,
-                description TEXT,
-                security TEXT,
-                source_name TEXT,
-                image TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                id          SERIAL PRIMARY KEY,
+                city        TEXT NOT NULL,
+                osm_id      TEXT NOT NULL,
+                name        TEXT NOT NULL,
+                lat         REAL,
+                lon         REAL,
+                address     TEXT NOT NULL DEFAULT '',
+                source_name TEXT NOT NULL DEFAULT 'Urban3P',
+                image       TEXT NOT NULL DEFAULT '',
+                created_at  TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                 UNIQUE(city, osm_id)
             )
         """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_objects_city ON objects(city)")
-        await db.commit()
-
-
-async def get_user(telegram_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT telegram_id, city FROM users WHERE telegram_id = ?",
-            (telegram_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return {"telegram_id": row[0], "city": row[1]}
-            return None
-
-
-async def save_user(telegram_id: int, city: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO users (telegram_id, city) VALUES (?, ?)",
-            (telegram_id, city)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_objects_city ON objects(city)"
         )
-        await db.commit()
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_objects_latlon ON objects(lat, lon)"
+        )
 
 
-async def get_objects(city: str, shown: set, limit: int = 3) -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """
-            SELECT name, coords, address, description, security, source_name, image
-            FROM objects
-            WHERE city = ?
-            ORDER BY RANDOM()
-            LIMIT ?
-            """,
-            (city, limit * 5),
-        ) as cursor:
-            rows = await cursor.fetchall()
+async def get_user(pool: asyncpg.Pool, telegram_id: int) -> dict | None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT telegram_id, city FROM users WHERE telegram_id = $1",
+            telegram_id
+        )
+    if row:
+        return {"telegram_id": row["telegram_id"], "city": row["city"]}
+    return None
 
+
+async def save_user(pool: asyncpg.Pool, telegram_id: int, city: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO users (telegram_id, city)
+               VALUES ($1, $2)
+               ON CONFLICT (telegram_id) DO UPDATE SET city = $2""",
+            telegram_id, city
+        )
+
+
+async def get_objects(
+    pool: asyncpg.Pool,
+    city: str,
+    shown_ids: set[int],
+    limit: int = 3,
+) -> list[dict]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, name, lat, lon, address, image, source_name
+               FROM objects
+               WHERE city = $1
+               ORDER BY RANDOM()
+               LIMIT $2""",
+            city, limit * 5,
+        )
     result = []
     for row in rows:
-        name = row[0]
-        if name in shown:
+        if row["id"] in shown_ids:
             continue
         result.append({
-            "name": name,
-            "coords": row[1] or "",
-            "address": row[2] or "",
-            "description": row[3] or "",
-            "security": row[4] or "",
-            "source_name": row[5] or "",
-            "image": row[6] or "",
-            "published_date": "",
+            "id": row["id"],
+            "name": row["name"],
+            "lat": row["lat"],
+            "lon": row["lon"],
+            "address": row["address"] or "",
+            "image": row["image"] or "",
+            "source_name": row["source_name"] or "",
         })
         if len(result) >= limit:
             break
     return result
 
 
-async def save_objects(city: str, objects: list):
-    async with aiosqlite.connect(DB_PATH) as db:
+async def save_objects(pool: asyncpg.Pool, city: str, objects: list[dict]) -> int:
+    saved = 0
+    async with pool.acquire() as conn:
         for obj in objects:
-            osm_id = obj.get("osm_id") or obj.get("name")
-            await db.execute(
-                """
-                INSERT OR IGNORE INTO objects
-                    (city, osm_id, name, coords, address, description, security, source_name, image)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    city,
-                    osm_id,
-                    obj.get("name", ""),
-                    obj.get("coords", ""),
-                    obj.get("address", ""),
-                    obj.get("description", ""),
-                    obj.get("security", ""),
-                    obj.get("source_name", ""),
-                    obj.get("image", ""),
-                ),
+            result = await conn.execute(
+                """INSERT INTO objects
+                       (city, osm_id, name, lat, lon, address, source_name, image)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                   ON CONFLICT (city, osm_id) DO NOTHING""",
+                city,
+                obj.get("osm_id") or obj.get("name"),
+                obj.get("name", ""),
+                obj.get("lat"),
+                obj.get("lon"),
+                obj.get("address", ""),
+                obj.get("source_name", "Urban3P"),
+                obj.get("image", ""),
             )
-        await db.commit()
+            # asyncpg returns command tag like "INSERT 0 1" (inserted) or "INSERT 0 0" (conflict)
+            if result.endswith(" 1"):
+                saved += 1
+    return saved
 
 
-async def get_city_count(city: str) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM objects WHERE city = ?", (city,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
+async def get_city_last_fetched(pool: asyncpg.Pool, city: str) -> datetime | None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT last_fetched_at FROM cities WHERE name = $1", city
+        )
+    if row and row["last_fetched_at"]:
+        return row["last_fetched_at"]
+    return None
 
 
-async def get_cache_age_days(city: str) -> float:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """
-            SELECT (julianday('now') - julianday(MAX(created_at)))
-            FROM objects WHERE city = ?
-            """,
-            (city,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row and row[0] is not None:
-                return float(row[0])
-    return 999.0
+async def update_city_fetched(pool: asyncpg.Pool, city: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO cities (name, last_fetched_at)
+               VALUES ($1, NOW())
+               ON CONFLICT (name) DO UPDATE SET last_fetched_at = NOW()""",
+            city
+        )
 
 
-async def clear_city_cache(city: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM objects WHERE city = ?", (city,))
-        await db.commit()
-
-
-async def get_all_cached_cities() -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT DISTINCT city FROM objects"
-        ) as cursor:
-            rows = await cursor.fetchall()
-    return [r[0] for r in rows]
+async def is_duplicate(
+    pool: asyncpg.Pool, city: str, lat: float | None, lon: float | None
+) -> bool:
+    if lat is None or lon is None:
+        return False
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id FROM objects
+               WHERE city = $1
+               AND lat BETWEEN $2 - 0.001 AND $2 + 0.001
+               AND lon BETWEEN $3 - 0.001 AND $3 + 0.001
+               LIMIT 1""",
+            city, lat, lon
+        )
+    return row is not None

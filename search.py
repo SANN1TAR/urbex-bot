@@ -1,27 +1,32 @@
-# Поиск заброшенных объектов через urban3p.ru (Tavily) + кеш в SQLite
-# Получает: тип объекта (zabroshka), город, список уже показанных
-# Отдаёт: список объектов с названием, координатами/адресом, фото
+# Search for abandoned objects via Tavily + urban3p.ru scraping
+# Returns objects with verified location (lat/lon or address) only
 
 import asyncio
-import json
 import logging
-import os
 import re
+from datetime import datetime, timezone, timedelta
 
+import asyncpg
 import httpx
-from groq import Groq
 from tavily import TavilyClient
-from dotenv import load_dotenv
 
-from database import get_objects, save_objects, get_city_count, get_cache_age_days, CACHE_TTL_DAYS
+from database import (
+    get_objects, save_objects, get_city_last_fetched,
+    update_city_fetched, is_duplicate, CACHE_REFRESH_DAYS,
+)
 
-load_dotenv()
 logger = logging.getLogger(__name__)
 
-tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+_tavily_client: TavilyClient | None = None
 
-_counters: dict = {}
+def init_search(tavily_api_key: str) -> None:
+    global _tavily_client
+    _tavily_client = TavilyClient(api_key=tavily_api_key)
+
+SOURCES = [
+    "site:urban3p.ru",
+    "site:urban3p.com",
+]
 
 BANNED_WORDS = {
     "москва-сити", "moscow city", "москва сити", "сити", "федерация",
@@ -35,11 +40,6 @@ BANNED_WORDS = {
     "снесён", "снесено", "снесена",
     "деревня", "садовое товарищество",
 }
-
-SOURCES = [
-    "site:urban3p.ru",
-    "site:urban3p.com",
-]
 
 JUNK_RE = re.compile(
     r'(\d+\s+заброшен|\bтоп[\s-]?\d+|\bч\.\s*\d+|часть\s+\d+|\||\bдзен\b|youtube|'
@@ -76,43 +76,26 @@ def _is_junk_name(name: str, title: str) -> bool:
     return False
 
 
-def _extract_address(text: str) -> str:
-    patterns = [
-        r'(?:ул\.|улица|пер\.|переулок|пр\.|проспект|ш\.|шоссе|бул\.|бульвар|пл\.|площадь)\s+[\w\s]+,?\s*д\.?\s*\d+[\w/]*',
-        r'[\w\s]+ (?:ул\.|улица),?\s*\d+[\w/]*',
-    ]
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
-        if m:
-            return m.group(0).strip()
-    return ""
-
-
-async def _get_coords_nominatim(name: str, city: str) -> str:
-    # Убираем "заброшенный/заброшенная" и "(Город)" из названия
-    clean = re.sub(r'заброш\w+\s*', '', name, flags=re.IGNORECASE)
-    clean = re.sub(r'\([^)]*\)', '', clean).strip()
-    queries = [
-        f"{clean}, {city}, Россия",
-        f"{name}, {city}, Россия",
-    ]
+def _parse_coords(coords_str: str) -> tuple[float, float] | None:
+    """Parse '55.1234, 37.5678' into (lat, lon) floats. Returns None if invalid."""
+    if not coords_str:
+        return None
+    m = re.search(r'([0-9]+\.[0-9]+)[,\s]+([0-9]+\.[0-9]+)', coords_str)
+    if not m:
+        return None
     try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            for q in queries:
-                resp = await client.get(
-                    "https://nominatim.openstreetmap.org/search",
-                    params={"q": q, "format": "json", "limit": 1},
-                    headers={"User-Agent": "UrbexBot/1.0"},
-                )
-                data = resp.json()
-                if data:
-                    return f"{float(data[0]['lat']):.4f}, {float(data[0]['lon']):.4f}"
-    except Exception:
-        pass
-    return ""
+        lat = float(m.group(1))
+        lon = float(m.group(2))
+        # Sanity check: Russia/CIS latitude 40-80, longitude 20-180
+        if 40 <= lat <= 80 and 20 <= lon <= 180:
+            return (lat, lon)
+        return None
+    except ValueError:
+        return None
 
 
 async def _scrape_object_page(url: str) -> dict:
+    """Scrape urban3p.ru object page for image, coords, address."""
     if not url or "urban3p" not in url:
         return {}
     try:
@@ -122,18 +105,21 @@ async def _scrape_object_page(url: str) -> dict:
                 return {}
             html = resp.text
 
-        # OG фото
+        # OG image
         img = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
         if not img:
             img = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html)
         image = img.group(1) if img else ""
 
-        # Адрес из текста
-        addr = re.search(r'(?:ул\.|улица|пер\.|проспект|пр-т|шоссе|бульвар|площадь)[^<]{3,50}', html, re.IGNORECASE)
+        # Address from page text
+        addr = re.search(
+            r'(?:ул\.|улица|пер\.|переулок|пр\.|проспект|ш\.|шоссе|бул\.|бульвар|пл\.|площадь)\s+[\w\s]+,?\s*д\.?\s*\d+[\w/]*',
+            html, re.IGNORECASE
+        )
         address = re.sub(r'\s+', ' ', addr.group(0)).strip() if addr else ""
 
-        # Координаты через /onmap
-        coords = ""
+        # Coordinates via /onmap POST
+        lat, lon = None, None
         m = re.search(r'/object(\d+)', url)
         if m:
             try:
@@ -142,56 +128,63 @@ async def _scrape_object_page(url: str) -> dict:
                         f"https://urban3p.ru/object{m.group(1)}/onmap",
                         data={"submitted": "смотреть на карте"},
                     )
-                    ll = re.search(r'([5-7][0-9]\.[0-9]{4,})[,\s]+([3-7][0-9]\.[0-9]{4,})', r.text)
+                    ll = re.search(r'([0-9]+\.[0-9]{4,})[,\s]+([0-9]+\.[0-9]{4,})', r.text)
                     if ll:
-                        coords = f"{ll.group(1)}, {ll.group(2)}"
-            except Exception:
-                pass
+                        parsed = _parse_coords(f"{ll.group(1)}, {ll.group(2)}")
+                        if parsed:
+                            lat, lon = parsed
+            except httpx.TimeoutException as e:
+                logger.debug(f"Timeout on /onmap for {url}: {e}")
+            except httpx.ConnectError as e:
+                logger.debug(f"ConnectError on /onmap for {url}: {e}")
+            except Exception as e:
+                logger.warning(f"Unexpected error on /onmap for {url}: {e}")
 
-        logger.info(f"Парсинг {url[-30:]}: фото={'да' if image else 'нет'}, coords={coords or 'нет'}")
-        return {"image": image, "coords": coords, "address": address}
+        logger.info(f"Scraped {url[-40:]}: image={'yes' if image else 'no'}, lat={lat}, address={address or 'none'}")
+        return {"image": image, "lat": lat, "lon": lon, "address": address}
+
+    except httpx.TimeoutException as e:
+        logger.warning(f"Timeout scraping {url}: {e}")
+        return {}
+    except httpx.ConnectError as e:
+        logger.warning(f"Connection error scraping {url}: {e}")
+        return {}
     except Exception as e:
-        logger.warning(f"Scrape error: {e}")
+        logger.error(f"Unexpected error scraping {url}: {e}")
         return {}
 
 
-def _tavily_photo(name: str, city: str) -> str:
-    try:
-        r = tavily_client.search(f"{name} {city} заброшка фото", max_results=3, include_images=True)
-        imgs = r.get("images", [])
-        return imgs[0] if imgs else ""
-    except Exception:
-        return ""
+async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
+    """Fetch new objects from urban3p.ru via Tavily. Returns only objects with location."""
+    if _tavily_client is None:
+        raise RuntimeError("search not initialized — call init_search() first")
 
-
-async def _fetch_from_web(city: str) -> list:
     objects = []
-    seen_names = set()
+    seen_names: set[str] = set()
 
     for source in SOURCES:
         try:
             data = await asyncio.to_thread(
-                lambda s=source: tavily_client.search(
-                    f"заброс заброшенная {city} {s}",
+                lambda s=source: _tavily_client.search(
+                    f"заброшенная {city} {s}",
                     max_results=10,
                     include_images=True,
                     search_depth="advanced",
                 )
             )
         except Exception as e:
-            logger.warning(f"Tavily error ({source}): {e}")
+            logger.warning(f"Tavily search error ({source}): {e}")
             continue
 
         results = data.get("results", [])
-        images = data.get("images", [])
-        logger.info(f"Источник '{source}': {len(results)} результатов")
+        logger.info(f"Tavily source '{source}': {len(results)} results for {city}")
 
-        for i, r in enumerate(results):
+        for r in results:
             title = r.get("title", "")
             url = r.get("url", "")
             content = r.get("content", "")
 
-            # Только страницы конкретных объектов
+            # Only individual object pages
             if "urban3p" in url and not re.search(r'/object\d+', url):
                 continue
 
@@ -207,95 +200,68 @@ async def _fetch_from_web(city: str) -> list:
                 continue
 
             page_data = await _scrape_object_page(url)
+            lat = page_data.get("lat")
+            lon = page_data.get("lon")
+            address = page_data.get("address", "")
+            image = page_data.get("image", "")
 
-            image = page_data.get("image") or (images[i] if i < len(images) else "")
-            if not image:
-                image = await asyncio.to_thread(_tavily_photo, name, city)
+            # Location filter: skip if no lat/lon AND no address
+            if lat is None and not address:
+                logger.info(f"Skipping '{name}' — no location data")
+                continue
 
-            coords = page_data.get("coords", "")
-            if not coords:
-                coords = await _get_coords_nominatim(name, city)
-
-            address = page_data.get("address", "") or _extract_address(content)
+            # Coordinate deduplication
+            if await is_duplicate(pool, city, lat, lon):
+                logger.info(f"Skipping '{name}' — duplicate within 100m")
+                continue
 
             objects.append({
                 "name": name,
-                "coords": coords,
+                "lat": lat,
+                "lon": lon,
                 "address": address,
-                "description": "",
-                "security": "",
                 "source_name": "Urban3P",
                 "image": image,
-                "published_date": "",
+                "osm_id": name,  # use name as unique key (urban3p has no stable ID in URL context)
             })
             seen_names.add(norm)
 
         if len(objects) >= 20:
             break
 
-    logger.info(f"Собрано объектов для {city}: {len(objects)}")
+    logger.info(f"Fetched {len(objects)} objects with location for {city}")
     return objects
 
 
-async def _fetch_and_cache(city: str) -> int:
-    objects = await _fetch_from_web(city)
+async def search_objects(
+    pool: asyncpg.Pool,
+    obj_type: str,
+    city: str,
+    shown_ids: set[int],
+) -> list[dict]:
+    """Main entry point. Returns up to 3 objects not yet shown to user."""
+    # Check if archive needs refreshing
+    last_fetched = await get_city_last_fetched(pool, city)
+    needs_refresh = (
+        last_fetched is None
+        or (datetime.now(timezone.utc) - last_fetched).days >= CACHE_REFRESH_DAYS
+    )
+
+    if needs_refresh:
+        logger.info(f"Refreshing archive for {city} (last: {last_fetched})")
+        try:
+            new_objects = await _fetch_from_web(city, pool)
+            if new_objects:
+                saved = await save_objects(pool, city, new_objects)
+                logger.info(f"Added {saved} new objects to archive for {city}")
+            await update_city_fetched(pool, city)
+        except Exception as e:
+            logger.error(f"Failed to fetch from web for {city}: {e}")
+            # Fall through to DB — return whatever is cached
+
+    # Get from archive
+    objects = await get_objects(pool, city, shown_ids, limit=3)
     if not objects:
-        return 0
-    await save_objects(city, objects)
-    return len(objects)
-
-
-async def search_objects(obj_type: str, city: str, shown: set) -> list:
-    count = await get_city_count(city)
-    age = await get_cache_age_days(city)
-
-    if count == 0 or age > CACHE_TTL_DAYS:
-        logger.info(f"Кеш для {city}: {count} объектов, возраст {age:.1f} дней — обновляем")
-        if await _fetch_and_cache(city) == 0:
-            return []
-    else:
-        logger.info(f"Кеш для {city}: {count} объектов — берём из базы")
-
-    objects = await get_objects(city, shown, limit=3)
-    if not objects:
-        objects = await get_objects(city, set(), limit=3)
+        # Shown set exhausted — reset and try again
+        objects = await get_objects(pool, city, set(), limit=3)
     return objects
-
-
-async def search_by_name(name: str, city: str) -> dict:
-    try:
-        data = await asyncio.to_thread(
-            lambda: tavily_client.search(
-                f"{name} {city} заброшка урбекс",
-                max_results=5,
-                include_images=True,
-            )
-        )
-        results = data.get("results", [])
-        images = data.get("images", [])
-        if not results:
-            return {"not_found": True}
-
-        content = "\n".join(f"- {r['title']}: {r['content']}" for r in results)
-        text = await asyncio.to_thread(
-            lambda: groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": (
-                    f'Найди инфу об объекте "{name}" в {city}. Отвечай только на русском.\n\n'
-                    f'Данные:\n{content}\n\n'
-                    f'JSON: {{"name":"...","coords":"...","address":"...","description":"..."}}\n'
-                    f'Не найдено — верни: {{"not_found":true}}'
-                )}],
-                temperature=0.3,
-            ).choices[0].message.content
-        )
-        text = text.strip()
-        if "```" in text:
-            parts = text.split("```")
-            text = parts[1][4:] if parts[1].startswith("json") else parts[1]
-        result = json.loads(text.strip())
-        if not result.get("not_found"):
-            result["image"] = images[0] if images else ""
-        return result
-    except Exception:
-        return {"not_found": True}
