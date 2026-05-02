@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import time
 
 import asyncpg
 from aiogram import Bot, Dispatcher, F
@@ -15,7 +14,7 @@ from aiogram.types import (
 )
 
 from config import get_config
-from database import get_user, init_db, save_user
+from database import get_user, init_db, save_user, mark_shown, get_shown_ids, reset_shown
 from search import search_objects, init_search
 
 logging.basicConfig(level=logging.INFO)
@@ -23,10 +22,6 @@ logger = logging.getLogger(__name__)
 
 # Module-level pool — set in main()
 _pool: asyncpg.Pool | None = None
-
-# In-memory shown tracking: uid → set of object IDs (integers)
-_shown_global: dict[int, set[int]] = {}
-_shown_timestamps: dict[int, float] = {}  # uid → last active timestamp
 
 DISCLAIMER = (
     "⚠️ <b>Стоп, читай сюда.</b>\n\n"
@@ -96,17 +91,6 @@ def _format_obj(obj: dict) -> str:
     return f"<b>{obj.get('name', 'Без названия')}</b>{location}"
 
 
-def _cleanup_shown() -> None:
-    """Remove shown entries inactive for more than 24 hours."""
-    cutoff = time.time() - 86400
-    stale = [uid for uid, ts in _shown_timestamps.items() if ts < cutoff]
-    for uid in stale:
-        _shown_global.pop(uid, None)
-        _shown_timestamps.pop(uid, None)
-    if stale:
-        logger.info(f"Cleaned up shown history for {len(stale)} inactive users")
-
-
 class Reg(StatesGroup):
     city = State()
 
@@ -173,8 +157,7 @@ async def cmd_help(message: Message):
 @dp.message(Command("restart"))
 async def cmd_restart(message: Message, state: FSMContext):
     uid = message.from_user.id
-    _shown_global.pop(uid, None)
-    _shown_timestamps.pop(uid, None)
+    await reset_shown(_pool, uid)
     await state.clear()
     await message.answer("Перезагрузил. Ищу заново — поехали.", reply_markup=MAIN_KB)
 
@@ -211,9 +194,8 @@ async def _send_one(message: Message, obj: dict):
 
 
 async def start_browsing(message: Message, state: FSMContext, obj_type: str, city: str):
-    _cleanup_shown()
     uid = message.from_user.id
-    shown_ids = _shown_global.get(uid, set())
+    shown_ids = await get_shown_ids(_pool, uid)
 
     await message.answer(f"Ща пробью {OBJ_TYPE_NAMES[obj_type]} в {city}... 🔍")
     objects = await search_objects(_pool, obj_type, city, shown_ids)
@@ -223,10 +205,8 @@ async def start_browsing(message: Message, state: FSMContext, obj_type: str, cit
         await message.answer("Попробуй позже или смени город.", reply_markup=MAIN_KB)
         return
 
-    new_ids = {o["id"] for o in objects}
-    combined = shown_ids | new_ids
-    _shown_global[uid] = combined if len(combined) <= 50 else new_ids
-    _shown_timestamps[uid] = time.time()
+    new_ids = [o["id"] for o in objects]
+    await mark_shown(_pool, uid, new_ids)
 
     await state.set_state(Browsing.active)
     await state.update_data(
@@ -256,7 +236,7 @@ async def handle_next(callback: CallbackQuery, state: FSMContext):
         return
 
     uid = callback.from_user.id
-    shown_ids = _shown_global.get(uid, set())
+    shown_ids = await get_shown_ids(_pool, uid)
     await callback.message.answer("Ищу ещё... 🔍")
     objects = await search_objects(_pool, data["obj_type"], data["city"], shown_ids)
 
@@ -271,10 +251,8 @@ async def handle_next(callback: CallbackQuery, state: FSMContext):
         )
         return
 
-    new_ids = {o["id"] for o in objects}
-    combined = shown_ids | new_ids
-    _shown_global[uid] = combined if len(combined) <= 50 else new_ids
-    _shown_timestamps[uid] = time.time()
+    new_ids = [o["id"] for o in objects]
+    await mark_shown(_pool, uid, new_ids)
 
     await state.update_data(
         cache=json.dumps([dict(o) for o in objects], ensure_ascii=False),
@@ -293,8 +271,7 @@ async def handle_restart(callback: CallbackQuery, state: FSMContext):
 
     data = await state.get_data()
     uid = callback.from_user.id
-    _shown_global.pop(uid, None)
-    _shown_timestamps.pop(uid, None)
+    await reset_shown(_pool, uid)
     await state.clear()
     await start_browsing(callback.message, state, data["obj_type"], data["city"])
 

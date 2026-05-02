@@ -35,6 +35,15 @@ SEARCH_TEMPLATES = [
     "заброшенная {city} site:urban3p.com",
 ]
 
+# Bounding boxes for cities [west,south,east,north] — for OSM queries
+CITY_BBOXES: dict[str, str] = {
+    "Москва": "36.8,55.4,38.0,56.1",
+    "Московская область": "35.9,54.7,39.5,56.9",
+    "Санкт-Петербург": "29.5,59.7,30.8,60.3",
+    "Екатеринбург": "60.4,56.6,61.1,56.97",
+    "Новосибирск": "82.6,54.7,83.2,55.2",
+}
+
 BANNED_WORDS = {
     "москва-сити", "moscow city", "москва сити", "сити", "федерация",
     "бизнес-центр", "бизнес центр", "офисный центр",
@@ -125,6 +134,113 @@ async def _get_coords_nominatim(name: str, city: str) -> tuple[float, float] | N
     except Exception as e:
         logger.debug(f"Nominatim error for '{name}': {e}")
     return None
+
+
+async def _fetch_from_osm(city: str) -> list[dict]:
+    """Fetch abandoned buildings from OpenStreetMap via ohsome API.
+    Returns objects with precise GPS coordinates — no scraping needed."""
+    bbox = CITY_BBOXES.get(city)
+    if not bbox:
+        logger.info(f"No OSM bbox configured for city: {city}")
+        return []
+
+    osm_filter = (
+        "abandoned:building=* "
+        "or (building=* and disused=yes) "
+        "or historic=ruins "
+        "or landuse=brownfield "
+        "or abandoned=yes"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                "https://api.ohsome.org/v1/elements/centroid",
+                params={
+                    "bboxes": bbox,
+                    "filter": osm_filter,
+                    "time": "2024-01-01",
+                    "properties": "tags",
+                },
+            )
+            if resp.status_code != 200:
+                logger.warning(f"ohsome API returned {resp.status_code} for {city}")
+                return []
+            data = resp.json()
+    except httpx.TimeoutException:
+        logger.warning(f"ohsome API timeout for {city}")
+        return []
+    except Exception as e:
+        logger.error(f"ohsome API error for {city}: {e}")
+        return []
+
+    objects = []
+    for feature in data.get("features", []):
+        props = feature.get("properties", {})
+        geom = feature.get("geometry", {})
+        coords = geom.get("coordinates", [])
+        if len(coords) < 2:
+            continue
+
+        lon, lat = float(coords[0]), float(coords[1])
+        # Validate coordinates are within Russia/CIS
+        if not (40 <= lat <= 80 and 20 <= lon <= 180):
+            continue
+
+        tags = props.get("tags", {})
+        osm_id = props.get("@osmId", "")
+
+        # Build name from tags
+        name = (
+            tags.get("name")
+            or tags.get("abandoned:name")
+            or tags.get("old_name")
+            or _build_osm_name(tags, osm_id)
+        )
+        if not name:
+            continue
+
+        address = " ".join(filter(None, [
+            tags.get("addr:street", ""),
+            tags.get("addr:housenumber", ""),
+        ])).strip()
+
+        objects.append({
+            "name": name,
+            "lat": lat,
+            "lon": lon,
+            "address": address,
+            "source_name": "OpenStreetMap",
+            "image": "",
+            "osm_id": osm_id,
+        })
+
+    logger.info(f"OSM fetched {len(objects)} objects for {city}")
+    return objects
+
+
+def _build_osm_name(tags: dict, osm_id: str) -> str:
+    """Build a human-readable name from OSM tags when 'name' tag is missing."""
+    type_map = {
+        "factory": "Заброшенный завод",
+        "industrial": "Заброшенное производство",
+        "hospital": "Заброшенная больница",
+        "school": "Заброшенная школа",
+        "kindergarten": "Заброшенный детский сад",
+        "office": "Заброшенный офис",
+        "warehouse": "Заброшенный склад",
+        "residential": "Заброшенный жилой дом",
+        "church": "Заброшенная церковь",
+        "ruins": "Руины",
+        "brownfield": "Заброшенная промзона",
+    }
+    for tag_key in ("abandoned:building", "building", "abandoned:amenity", "amenity", "landuse", "historic"):
+        val = tags.get(tag_key, "")
+        if val in type_map:
+            return type_map[val]
+        if val and val != "yes":
+            return f"Заброшенный объект ({val})"
+    return ""
 
 
 async def _scrape_object_page(url: str) -> dict:
@@ -292,7 +408,32 @@ async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
         })
         seen_names.add(norm)
 
-    logger.info(f"Fetched {len(objects)} objects with location for {city}")
+    # Also fetch from OpenStreetMap for cities where we have bbox
+    osm_objects = await _fetch_from_osm(city)
+    logger.info(f"OSM returned {len(osm_objects)} raw objects for {city}")
+
+    for obj in osm_objects:
+        lat = obj["lat"]
+        lon = obj["lon"]
+        norm = _normalize_name(obj["name"])
+
+        if norm in seen_names:
+            continue
+        if not obj["name"]:
+            continue
+
+        coord_key = (round(lat, 3), round(lon, 3))
+        if coord_key in seen_coords:
+            continue
+        seen_coords.add(coord_key)
+
+        if await is_duplicate(pool, city, lat, lon):
+            continue
+
+        objects.append(obj)
+        seen_names.add(norm)
+
+    logger.info(f"Total fetched {len(objects)} objects with location for {city}")
     return objects
 
 

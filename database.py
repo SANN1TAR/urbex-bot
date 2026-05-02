@@ -41,6 +41,17 @@ async def init_db(pool: asyncpg.Pool) -> None:
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_objects_latlon ON objects(lat, lon)"
         )
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_shown (
+                user_id   BIGINT NOT NULL,
+                object_id INTEGER NOT NULL,
+                shown_at  TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                PRIMARY KEY (user_id, object_id)
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_shown_user ON user_shown(user_id)"
+        )
 
 
 async def get_user(pool: asyncpg.Pool, telegram_id: int) -> dict | None:
@@ -138,6 +149,31 @@ async def update_city_fetched(pool: asyncpg.Pool, city: str) -> None:
                VALUES ($1, NOW())
                ON CONFLICT (name) DO UPDATE SET last_fetched_at = NOW()""",
             city
+        )
+
+
+async def mark_shown(pool: asyncpg.Pool, user_id: int, object_ids: list[int]) -> None:
+    if not object_ids:
+        return
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            "INSERT INTO user_shown (user_id, object_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            [(user_id, oid) for oid in object_ids],
+        )
+
+
+async def get_shown_ids(pool: asyncpg.Pool, user_id: int) -> set[int]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT object_id FROM user_shown WHERE user_id = $1", user_id
+        )
+    return {r["object_id"] for r in rows}
+
+
+async def reset_shown(pool: asyncpg.Pool, user_id: int) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM user_shown WHERE user_id = $1", user_id
         )
 
 
