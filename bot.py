@@ -202,7 +202,10 @@ async def start_browsing(message: Message, state: FSMContext, obj_type: str, cit
 
     if not objects:
         await state.clear()
-        await message.answer("Попробуй позже или смени город.", reply_markup=MAIN_KB)
+        await message.answer(
+            "Пока пусто — база пополняется. Попробуй позже или смени город.",
+            reply_markup=MAIN_KB,
+        )
         return
 
     new_ids = [o["id"] for o in objects]
@@ -282,6 +285,8 @@ async def handle_zabroshka(message: Message, state: FSMContext):
     if not user:
         return
     await state.clear()
+    # "Заброшка" always starts a fresh session — reset shown history
+    await reset_shown(_pool, message.from_user.id)
     await start_browsing(message, state, "zabroshka", user["city"])
 
 
