@@ -94,6 +94,30 @@ def _parse_coords(coords_str: str) -> tuple[float, float] | None:
         return None
 
 
+async def _get_coords_nominatim(name: str, city: str) -> tuple[float, float] | None:
+    """Geocode by name via Nominatim. Returns (lat, lon) only if within Russia/CIS bounds."""
+    clean = re.sub(r'заброш\w+\s*', '', name, flags=re.IGNORECASE)
+    clean = re.sub(r'\([^)]*\)', '', clean).strip()
+    queries = [f"{clean}, {city}, Россия", f"{name}, {city}, Россия"]
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            for q in queries:
+                resp = await client.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"q": q, "format": "json", "limit": 1, "countrycodes": "ru,kz,ua,by"},
+                    headers={"User-Agent": "UrbexBot/1.0"},
+                )
+                data = resp.json()
+                if data:
+                    parsed = _parse_coords(f"{data[0]['lat']}, {data[0]['lon']}")
+                    if parsed:
+                        logger.info(f"Nominatim found coords for '{name}': {parsed}")
+                        return parsed
+    except Exception as e:
+        logger.debug(f"Nominatim error for '{name}': {e}")
+    return None
+
+
 async def _scrape_object_page(url: str) -> dict:
     """Scrape urban3p.ru object page for image, coords, address."""
     if not url or "urban3p" not in url:
@@ -118,30 +142,26 @@ async def _scrape_object_page(url: str) -> dict:
         )
         address = re.sub(r'\s+', ' ', addr.group(0)).strip() if addr else ""
 
-        # Coordinates via /onmap POST — use same domain as source URL
+        # Coordinates: search in HTML (JSON data, JS variables, data attributes)
         lat, lon = None, None
-        m = re.search(r'(urban3p\.(ru|com))/object(\d+)', url)
-        if m:
-            domain = m.group(1)
-            obj_id = m.group(3)
-            try:
-                async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "Mozilla/5.0"}) as client:
-                    r = await client.post(
-                        f"https://{domain}/object{obj_id}/onmap",
-                        data={"submitted": "смотреть на карте"},
-                    )
-                    ll = re.search(r'([0-9]+\.[0-9]{4,})[,\s]+([0-9]+\.[0-9]{4,})', r.text)
-                    if ll:
-                        parsed = _parse_coords(f"{ll.group(1)}, {ll.group(2)}")
-                        if parsed:
-                            lat, lon = parsed
-                    logger.info(f"/onmap {domain} object{obj_id}: coords={'yes' if lat else 'no'}")
-            except httpx.TimeoutException as e:
-                logger.debug(f"Timeout on /onmap for {url}: {e}")
-            except httpx.ConnectError as e:
-                logger.debug(f"ConnectError on /onmap for {url}: {e}")
-            except Exception as e:
-                logger.warning(f"Unexpected error on /onmap for {url}: {e}")
+        coord_patterns = [
+            # JSON: "lat":55.123,"lon":37.456 or "latitude":55.123,"longitude":37.456
+            r'"lat(?:itude)?"\s*:\s*"?([4-7][0-9]\.[0-9]+)"?[^}]*?"lo?n(?:gitude)?"\s*:\s*"?([2-9][0-9]\.[0-9]+)"?',
+            # JS: lat: 55.123, lon: 37.456
+            r'\blat(?:itude)?\s*[:=]\s*([4-7][0-9]\.[0-9]+).*?\blo?n(?:gitude)?\s*[:=]\s*([2-9][0-9]\.[0-9]+)',
+            # data-lat="55.123" data-lon="37.456"
+            r'data-lat[^=]*=\s*["\']([4-7][0-9]\.[0-9]+)["\'].*?data-lo?n[^=]*=\s*["\']([2-9][0-9]\.[0-9]+)["\']',
+            # LatLng(55.123, 37.456) or [55.123, 37.456]
+            r'(?:LatLng|center)\s*[\(\[]\s*([4-7][0-9]\.[0-9]+)\s*,\s*([2-9][0-9]\.[0-9]+)',
+        ]
+        for pattern in coord_patterns:
+            cm = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+            if cm:
+                parsed = _parse_coords(f"{cm.group(1)}, {cm.group(2)}")
+                if parsed:
+                    lat, lon = parsed
+                    logger.info(f"Found coords in HTML for {url[-30:]}: {lat}, {lon}")
+                    break
 
         logger.info(f"Scraped {url[-40:]}: image={'yes' if image else 'no'}, lat={lat}, address={address or 'none'}")
         return {"image": image, "lat": lat, "lon": lon, "address": address}
@@ -208,7 +228,7 @@ async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
             address = page_data.get("address", "")
             image = page_data.get("image", "")
 
-            # Fallback: extract address from Tavily content snippet
+            # Fallback 1: extract address from Tavily content snippet
             if lat is None and not address:
                 addr_match = re.search(
                     r'(?:ул\.|улица|пер\.|проспект|шоссе|бульвар|площадь)\s+[\w\s]+,?\s*(?:д\.?\s*\d+[\w/]*)?',
@@ -216,6 +236,12 @@ async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
                 )
                 if addr_match:
                     address = re.sub(r'\s+', ' ', addr_match.group(0)).strip()
+
+            # Fallback 2: Nominatim geocoding as last resort
+            if lat is None and not address:
+                coords = await _get_coords_nominatim(name, city)
+                if coords:
+                    lat, lon = coords
 
             # Location filter: skip if no lat/lon AND no address
             if lat is None and not address:
