@@ -2,6 +2,7 @@
 # Returns objects with verified location (lat/lon or address) only
 
 import asyncio
+import hashlib
 import logging
 import re
 from datetime import datetime, timezone, timedelta
@@ -404,7 +405,7 @@ async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
             "address": address,
             "source_name": "Urban3P",
             "image": image,
-            "osm_id": name,
+            "osm_id": "t_" + hashlib.md5(url.encode()).hexdigest()[:16],
         })
         seen_names.add(norm)
 

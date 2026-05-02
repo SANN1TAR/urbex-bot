@@ -81,20 +81,28 @@ async def get_objects(
     shown_ids: set[int],
     limit: int = 3,
 ) -> list[dict]:
+    shown_list = list(shown_ids) if shown_ids else []
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT id, name, lat, lon, address, image, source_name
-               FROM objects
-               WHERE city = $1
-               ORDER BY RANDOM()
-               LIMIT $2""",
-            city, limit * 5,
-        )
-    result = []
-    for row in rows:
-        if row["id"] in shown_ids:
-            continue
-        result.append({
+        if shown_list:
+            rows = await conn.fetch(
+                """SELECT id, name, lat, lon, address, image, source_name
+                   FROM objects
+                   WHERE city = $1 AND NOT (id = ANY($2::int[]))
+                   ORDER BY RANDOM()
+                   LIMIT $3""",
+                city, shown_list, limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """SELECT id, name, lat, lon, address, image, source_name
+                   FROM objects
+                   WHERE city = $1
+                   ORDER BY RANDOM()
+                   LIMIT $2""",
+                city, limit,
+            )
+    return [
+        {
             "id": row["id"],
             "name": row["name"],
             "lat": row["lat"],
@@ -102,10 +110,9 @@ async def get_objects(
             "address": row["address"] or "",
             "image": row["image"] or "",
             "source_name": row["source_name"] or "",
-        })
-        if len(result) >= limit:
-            break
-    return result
+        }
+        for row in rows
+    ]
 
 
 async def save_objects(pool: asyncpg.Pool, city: str, objects: list[dict]) -> int:

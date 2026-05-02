@@ -194,11 +194,14 @@ async def _send_one(message: Message, obj: dict):
 async def _show_next(message: Message, state: FSMContext) -> None:
     """Show next object from cache, or fetch more from DB."""
     data = await state.get_data()
+    if data.get("loading"):
+        return
+    await state.update_data(loading=True)
     cache = json.loads(data["cache"])
     idx = data["idx"] + 1
 
     if idx < len(cache):
-        await state.update_data(idx=idx)
+        await state.update_data(idx=idx, loading=False)
         await _send_one(message, cache[idx])
         return
 
@@ -222,6 +225,7 @@ async def _show_next(message: Message, state: FSMContext) -> None:
     await state.update_data(
         cache=json.dumps([dict(o) for o in objects], ensure_ascii=False),
         idx=0,
+        loading=False,
     )
     await _send_one(message, objects[0])
 
