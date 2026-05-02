@@ -9,7 +9,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
     KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
 )
 
@@ -20,7 +19,6 @@ from search import search_objects, init_search
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Module-level pool — set in main()
 _pool: asyncpg.Pool | None = None
 
 DISCLAIMER = (
@@ -39,6 +37,7 @@ VPN_NOTE = (
 
 STALE_NOTE = "⚡ Не серчай, инфа может быть устаревшей. Перед вылазкой перепроверь."
 
+# Main screen keyboard
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🏚️ Заброшка")],
@@ -47,12 +46,16 @@ MAIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-NAV_KB = InlineKeyboardMarkup(inline_keyboard=[[
-    InlineKeyboardButton(text="➡️ Следующий", callback_data="next"),
-    InlineKeyboardButton(text="🔄 Заново", callback_data="restart"),
-]])
+# Keyboard while browsing — "Заброшка" = next, "Завершить" = end session
+BROWSING_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🏚️ Заброшка")],
+        [KeyboardButton(text="✖️ Завершить поиск")],
+    ],
+    resize_keyboard=True,
+)
 
-MENU_BUTTONS = {"🏚️ Заброшка", "🏙️ Сменить город"}
+MENU_BUTTONS = {"🏚️ Заброшка", "🏙️ Сменить город", "✖️ Завершить поиск"}
 OBJ_TYPE_NAMES = {"zabroshka": "заброшки"}
 
 CITY_ALIASES = {
@@ -110,10 +113,9 @@ HELP_TEXT = """
 <b>🏚 Как пользоваться ботом</b>
 
 <b>Кнопки:</b>
-🏚️ <b>Заброшка</b> — найти заброшенные объекты в твоём городе. Первый поиск занимает ~15 сек, потом быстрее.
-➡️ <b>Следующий</b> — показать другой объект
-🔄 <b>Заново</b> — начать с начала, сбросить показанные
-🏙️ <b>Сменить город</b> — изменить город поиска
+🏚️ <b>Заброшка</b> — начать поиск. Во время сессии: следующий объект.
+✖️ <b>Завершить поиск</b> — закончить сессию, вернуться в меню.
+🏙️ <b>Сменить город</b> — изменить город поиска.
 
 <b>Команды:</b>
 /start — начало работы
@@ -122,9 +124,6 @@ HELP_TEXT = """
 
 <b>Почему нет адреса или координат?</b>
 Не у всех объектов есть публичные координаты. Если локации нет — такой объект бот не показывает.
-
-<b>Пишет "Попробуй позже"?</b>
-Нажми /restart — это запустит новый поиск объектов.
 
 <b>⚠️ Важно:</b> вся информация из открытых источников и может быть устаревшей. Перед выездом проверяй сам.
 """
@@ -156,8 +155,7 @@ async def cmd_help(message: Message):
 
 @dp.message(Command("restart"))
 async def cmd_restart(message: Message, state: FSMContext):
-    uid = message.from_user.id
-    await reset_shown(_pool, uid)
+    await reset_shown(_pool, message.from_user.id)
     await state.clear()
     await message.answer("Перезагрузил. Ищу заново — поехали.", reply_markup=MAIN_KB)
 
@@ -175,27 +173,64 @@ async def reg_city(message: Message, state: FSMContext):
 
 
 async def _send_one(message: Message, obj: dict):
+    """Send one object card. No inline buttons — navigation via reply keyboard."""
     image = obj.get("image", "")
     if image:
         try:
             await message.answer_photo(photo=image)
         except Exception as e:
-            logger.debug(f"Failed to send photo {image[:50]}: {e}")
+            logger.debug(f"Failed to send photo: {e}")
     try:
         await message.answer(
             _format_obj(obj),
             parse_mode="HTML",
             disable_web_page_preview=True,
-            reply_markup=NAV_KB,
         )
         await message.answer(STALE_NOTE)
     except Exception as e:
         logger.error(f"Failed to send object card: {e}")
 
 
-async def start_browsing(message: Message, state: FSMContext, obj_type: str, city: str):
+async def _show_next(message: Message, state: FSMContext) -> None:
+    """Show next object from cache, or fetch more from DB."""
+    data = await state.get_data()
+    cache = json.loads(data["cache"])
+    idx = data["idx"] + 1
+
+    if idx < len(cache):
+        await state.update_data(idx=idx)
+        await _send_one(message, cache[idx])
+        return
+
     uid = message.from_user.id
     shown_ids = await get_shown_ids(_pool, uid)
+    await message.answer("Ищу ещё... 🔍")
+    objects = await search_objects(_pool, data["obj_type"], data["city"], shown_ids)
+
+    if not objects:
+        await state.clear()
+        await message.answer(
+            "Показал всё что знаю 🏁\n\n"
+            "Нажми 🏚️ <b>Заброшка</b> чтобы начать заново.",
+            parse_mode="HTML",
+            reply_markup=MAIN_KB,
+        )
+        return
+
+    new_ids = [o["id"] for o in objects]
+    await mark_shown(_pool, uid, new_ids)
+    await state.update_data(
+        cache=json.dumps([dict(o) for o in objects], ensure_ascii=False),
+        idx=0,
+    )
+    await _send_one(message, objects[0])
+
+
+async def _start_session(message: Message, state: FSMContext, obj_type: str, city: str):
+    """Start a fresh browsing session."""
+    uid = message.from_user.id
+    await reset_shown(_pool, uid)
+    shown_ids = await get_shown_ids(_pool, uid)  # empty after reset
 
     await message.answer(f"Ща пробью {OBJ_TYPE_NAMES[obj_type]} в {city}... 🔍")
     objects = await search_objects(_pool, obj_type, city, shown_ids)
@@ -218,76 +253,32 @@ async def start_browsing(message: Message, state: FSMContext, obj_type: str, cit
         cache=json.dumps([dict(o) for o in objects], ensure_ascii=False),
         idx=0,
     )
+    # Switch keyboard to browsing mode
+    await message.answer("Нашёл. Листай:", reply_markup=BROWSING_KB)
     await _send_one(message, objects[0])
 
 
-@dp.callback_query(F.data == "next", Browsing.active)
-async def handle_next(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    data = await state.get_data()
-    cache = json.loads(data["cache"])
-    idx = data["idx"] + 1
-
-    if idx < len(cache):
-        await state.update_data(idx=idx)
-        await _send_one(callback.message, cache[idx])
-        return
-
-    uid = callback.from_user.id
-    shown_ids = await get_shown_ids(_pool, uid)
-    await callback.message.answer("Ищу ещё... 🔍")
-    objects = await search_objects(_pool, data["obj_type"], data["city"], shown_ids)
-
-    if not objects:
-        await state.clear()
-        await callback.message.answer(
-            "Показал всё что знаю 🏁\n\n"
-            "Нажми 🔄 <b>Заново</b> чтобы посмотреть сначала, "
-            "или подожди — бот пополняет базу каждые 7 дней.",
-            parse_mode="HTML",
-            reply_markup=MAIN_KB,
-        )
-        return
-
-    new_ids = [o["id"] for o in objects]
-    await mark_shown(_pool, uid, new_ids)
-
-    await state.update_data(
-        cache=json.dumps([dict(o) for o in objects], ensure_ascii=False),
-        idx=0,
-    )
-    await _send_one(callback.message, objects[0])
+# "Заброшка" during active session → next object
+@dp.message(F.text == "🏚️ Заброшка", Browsing.active)
+async def handle_next_in_session(message: Message, state: FSMContext):
+    await _show_next(message, state)
 
 
-@dp.callback_query(F.data == "restart", Browsing.active)
-async def handle_restart(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    data = await state.get_data()
-    uid = callback.from_user.id
-    await reset_shown(_pool, uid)
-    await state.clear()
-    await start_browsing(callback.message, state, data["obj_type"], data["city"])
-
-
+# "Заброшка" on main screen → start new session
 @dp.message(F.text == "🏚️ Заброшка")
 async def handle_zabroshka(message: Message, state: FSMContext):
     user = await _require_user(message)
     if not user:
         return
     await state.clear()
-    # "Заброшка" always starts a fresh session — reset shown history
-    await reset_shown(_pool, message.from_user.id)
-    await start_browsing(message, state, "zabroshka", user["city"])
+    await _start_session(message, state, "zabroshka", user["city"])
+
+
+# "Завершить поиск" → end session, back to main screen
+@dp.message(F.text == "✖️ Завершить поиск")
+async def handle_stop_browsing(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Завершил. Когда захочешь — нажми 🏚️ Заброшка.", reply_markup=MAIN_KB)
 
 
 @dp.message(F.text == "🏙️ Сменить город")
