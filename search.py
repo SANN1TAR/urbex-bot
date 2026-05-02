@@ -23,9 +23,16 @@ def init_search(tavily_api_key: str) -> None:
     global _tavily_client
     _tavily_client = TavilyClient(api_key=tavily_api_key)
 
-SOURCES = [
-    "site:urban3p.ru",
-    "site:urban3p.com",
+# Search query templates — {city} replaced at runtime
+SEARCH_TEMPLATES = [
+    "заброшенный завод {city} site:urban3p.ru",
+    "заброшенная больница {city} site:urban3p.ru",
+    "заброшенная фабрика {city} site:urban3p.ru",
+    "заброшенная школа {city} site:urban3p.ru",
+    "заброшенный институт {city} site:urban3p.ru",
+    "заброшенный санаторий {city} site:urban3p.ru",
+    "заброшенный {city} site:urban3p.com",
+    "заброшенная {city} site:urban3p.com",
 ]
 
 BANNED_WORDS = {
@@ -179,104 +186,111 @@ async def _scrape_object_page(url: str) -> dict:
         return {}
 
 
+async def _tavily_search_one(query: str) -> list:
+    """Run one Tavily query, return results list."""
+    try:
+        data = await asyncio.to_thread(
+            lambda: _tavily_client.search(
+                query,
+                max_results=10,
+                include_images=True,
+                search_depth="advanced",
+            )
+        )
+        results = data.get("results", [])
+        logger.info(f"Tavily '{query[:50]}': {len(results)} results")
+        return results
+    except Exception as e:
+        logger.warning(f"Tavily error for '{query[:40]}': {e}")
+        return []
+
+
 async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
-    """Fetch new objects from urban3p.ru via Tavily. Returns only objects with location."""
+    """Fetch objects via multiple parallel Tavily queries. Returns only objects with location."""
     if _tavily_client is None:
         raise RuntimeError("search not initialized — call init_search() first")
 
+    queries = [t.format(city=city) for t in SEARCH_TEMPLATES]
+    all_results_lists = await asyncio.gather(*[_tavily_search_one(q) for q in queries])
+    all_results = [r for sublist in all_results_lists for r in sublist]
+    logger.info(f"Total raw results for {city}: {len(all_results)}")
+
     objects = []
     seen_names: set[str] = set()
-    seen_coords: set[tuple[float, float]] = set()  # in-batch coord dedup
+    seen_urls: set[str] = set()
+    seen_coords: set[tuple[float, float]] = set()
 
-    for source in SOURCES:
-        try:
-            data = await asyncio.to_thread(
-                lambda s=source: _tavily_client.search(
-                    f"заброшенная {city} {s}",
-                    max_results=20,
-                    include_images=True,
-                    search_depth="advanced",
-                )
-            )
-        except Exception as e:
-            logger.warning(f"Tavily search error ({source}): {e}")
+    for r in all_results:
+        title = r.get("title", "")
+        url = r.get("url", "")
+        content = r.get("content", "")
+
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        if "urban3p" in url and not re.search(r'/object\d+', url):
             continue
 
-        results = data.get("results", [])
-        logger.info(f"Tavily source '{source}': {len(results)} results for {city}")
+        name = _extract_name(title)
+        if not name:
+            continue
+        norm = _normalize_name(name)
+        if norm in seen_names:
+            continue
+        if _is_junk_name(name, title):
+            continue
+        if city.lower() not in content.lower() and city.lower() not in title.lower():
+            continue
 
-        for r in results:
-            title = r.get("title", "")
-            url = r.get("url", "")
-            content = r.get("content", "")
+        page_data = await _scrape_object_page(url)
+        lat = page_data.get("lat")
+        lon = page_data.get("lon")
+        address = page_data.get("address", "")
+        image = page_data.get("image", "")
 
-            # Only individual object pages
-            if "urban3p" in url and not re.search(r'/object\d+', url):
+        # Fallback 1: address from Tavily content snippet
+        if lat is None and not address:
+            addr_match = re.search(
+                r'(?:ул\.|улица|пер\.|проспект|шоссе|бульвар|площадь)\s+[\w\s]+,?\s*(?:д\.?\s*\d+[\w/]*)?',
+                content, re.IGNORECASE
+            )
+            if addr_match:
+                address = re.sub(r'\s+', ' ', addr_match.group(0)).strip()
+
+        # Fallback 2: Nominatim geocoding
+        if lat is None and not address:
+            coords = await _get_coords_nominatim(name, city)
+            if coords:
+                lat, lon = coords
+
+        if lat is None and not address:
+            logger.info(f"Skipping '{name}' — no location data")
+            continue
+
+        # In-batch coord dedup
+        if lat is not None and lon is not None:
+            coord_key = (round(lat, 3), round(lon, 3))
+            if coord_key in seen_coords:
+                logger.info(f"Skipping '{name}' — in-batch duplicate coords")
                 continue
+            seen_coords.add(coord_key)
 
-            name = _extract_name(title)
-            if not name:
-                continue
-            norm = _normalize_name(name)
-            if norm in seen_names:
-                continue
-            if _is_junk_name(name, title):
-                continue
-            if city.lower() not in content.lower() and city.lower() not in title.lower():
-                continue
+        # DB coord dedup
+        if await is_duplicate(pool, city, lat, lon):
+            logger.info(f"Skipping '{name}' — duplicate within 100m")
+            continue
 
-            page_data = await _scrape_object_page(url)
-            lat = page_data.get("lat")
-            lon = page_data.get("lon")
-            address = page_data.get("address", "")
-            image = page_data.get("image", "")
-
-            # Fallback 1: extract address from Tavily content snippet
-            if lat is None and not address:
-                addr_match = re.search(
-                    r'(?:ул\.|улица|пер\.|проспект|шоссе|бульвар|площадь)\s+[\w\s]+,?\s*(?:д\.?\s*\d+[\w/]*)?',
-                    content, re.IGNORECASE
-                )
-                if addr_match:
-                    address = re.sub(r'\s+', ' ', addr_match.group(0)).strip()
-
-            # Fallback 2: Nominatim geocoding as last resort
-            if lat is None and not address:
-                coords = await _get_coords_nominatim(name, city)
-                if coords:
-                    lat, lon = coords
-
-            # Location filter: skip if no lat/lon AND no address
-            if lat is None and not address:
-                logger.info(f"Skipping '{name}' — no location data")
-                continue
-
-            # In-batch coordinate dedup (same fetch run)
-            if lat is not None and lon is not None:
-                coord_key = (round(lat, 3), round(lon, 3))
-                if coord_key in seen_coords:
-                    logger.info(f"Skipping '{name}' — in-batch duplicate coords")
-                    continue
-                seen_coords.add(coord_key)
-
-            # DB coordinate deduplication
-            if await is_duplicate(pool, city, lat, lon):
-                logger.info(f"Skipping '{name}' — duplicate within 100m")
-                continue
-
-            objects.append({
-                "name": name,
-                "lat": lat,
-                "lon": lon,
-                "address": address,
-                "source_name": "Urban3P",
-                "image": image,
-                "osm_id": name,  # use name as unique key (urban3p has no stable ID in URL context)
-            })
-            seen_names.add(norm)
-
-        if len(objects) >= 20:
-            break
+        objects.append({
+            "name": name,
+            "lat": lat,
+            "lon": lon,
+            "address": address,
+            "source_name": "Urban3P",
+            "image": image,
+            "osm_id": name,
+        })
+        seen_names.add(norm)
 
     logger.info(f"Fetched {len(objects)} objects with location for {city}")
     return objects
