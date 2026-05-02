@@ -118,14 +118,16 @@ async def _scrape_object_page(url: str) -> dict:
         )
         address = re.sub(r'\s+', ' ', addr.group(0)).strip() if addr else ""
 
-        # Coordinates via /onmap POST
+        # Coordinates via /onmap POST — use same domain as source URL
         lat, lon = None, None
-        m = re.search(r'/object(\d+)', url)
+        m = re.search(r'(urban3p\.(ru|com))/object(\d+)', url)
         if m:
+            domain = m.group(1)
+            obj_id = m.group(3)
             try:
                 async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "Mozilla/5.0"}) as client:
                     r = await client.post(
-                        f"https://urban3p.ru/object{m.group(1)}/onmap",
+                        f"https://{domain}/object{obj_id}/onmap",
                         data={"submitted": "смотреть на карте"},
                     )
                     ll = re.search(r'([0-9]+\.[0-9]{4,})[,\s]+([0-9]+\.[0-9]{4,})', r.text)
@@ -133,6 +135,7 @@ async def _scrape_object_page(url: str) -> dict:
                         parsed = _parse_coords(f"{ll.group(1)}, {ll.group(2)}")
                         if parsed:
                             lat, lon = parsed
+                    logger.info(f"/onmap {domain} object{obj_id}: coords={'yes' if lat else 'no'}")
             except httpx.TimeoutException as e:
                 logger.debug(f"Timeout on /onmap for {url}: {e}")
             except httpx.ConnectError as e:
@@ -204,6 +207,15 @@ async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
             lon = page_data.get("lon")
             address = page_data.get("address", "")
             image = page_data.get("image", "")
+
+            # Fallback: extract address from Tavily content snippet
+            if lat is None and not address:
+                addr_match = re.search(
+                    r'(?:ул\.|улица|пер\.|проспект|шоссе|бульвар|площадь)\s+[\w\s]+,?\s*(?:д\.?\s*\d+[\w/]*)?',
+                    content, re.IGNORECASE
+                )
+                if addr_match:
+                    address = re.sub(r'\s+', ' ', addr_match.group(0)).strip()
 
             # Location filter: skip if no lat/lon AND no address
             if lat is None and not address:
