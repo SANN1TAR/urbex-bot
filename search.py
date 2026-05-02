@@ -259,6 +259,13 @@ async def search_objects(
         or (datetime.now(timezone.utc) - last_fetched).days >= CACHE_REFRESH_DAYS
     )
 
+    # Also refresh if DB is empty for this city (previous fetch may have yielded 0 objects)
+    if not needs_refresh:
+        existing = await pool.fetchval("SELECT COUNT(*) FROM objects WHERE city = $1", city)
+        if existing == 0:
+            logger.info(f"City {city} has 0 objects in archive — forcing refresh")
+            needs_refresh = True
+
     if needs_refresh:
         logger.info(f"Refreshing archive for {city} (last: {last_fetched})")
         try:
@@ -266,7 +273,9 @@ async def search_objects(
             if new_objects:
                 saved = await save_objects(pool, city, new_objects)
                 logger.info(f"Added {saved} new objects to archive for {city}")
-            await update_city_fetched(pool, city)
+                await update_city_fetched(pool, city)  # only mark fetched if we got objects
+            else:
+                logger.warning(f"Fetch returned 0 objects for {city} — not updating fetch timestamp")
         except Exception as e:
             logger.error(f"Failed to fetch from web for {city}: {e}")
             # Fall through to DB — return whatever is cached
