@@ -317,9 +317,5 @@ async def search_objects(
             logger.error(f"Failed to fetch from web for {city}: {e}")
             # Fall through to DB — return whatever is cached
 
-    # Get from archive
-    objects = await get_objects(pool, city, shown_ids, limit=3)
-    if not objects:
-        # Shown set exhausted — reset and try again
-        objects = await get_objects(pool, city, set(), limit=3)
-    return objects
+    # Get from archive — strictly respect shown_ids (no auto-reset)
+    return await get_objects(pool, city, shown_ids, limit=3)

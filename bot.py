@@ -262,7 +262,13 @@ async def handle_next(callback: CallbackQuery, state: FSMContext):
 
     if not objects:
         await state.clear()
-        await callback.message.answer("Попробуй позже или смени город.", reply_markup=MAIN_KB)
+        await callback.message.answer(
+            "Показал всё что знаю 🏁\n\n"
+            "Нажми 🔄 <b>Заново</b> чтобы посмотреть сначала, "
+            "или подожди — бот пополняет базу каждые 7 дней.",
+            parse_mode="HTML",
+            reply_markup=MAIN_KB,
+        )
         return
 
     new_ids = {o["id"] for o in objects}
