@@ -105,27 +105,31 @@ async def get_objects(
 
 
 async def save_objects(pool: asyncpg.Pool, city: str, objects: list[dict]) -> int:
-    saved = 0
+    if not objects:
+        return 0
+    rows = [
+        (
+            city,
+            obj["osm_id"],
+            obj.get("name", ""),
+            obj.get("lat"),
+            obj.get("lon"),
+            obj.get("address", ""),
+            obj.get("source_name", "Urban3P"),
+            obj.get("image", ""),
+        )
+        for obj in objects
+    ]
     async with pool.acquire() as conn:
-        for obj in objects:
-            result = await conn.execute(
+        async with conn.transaction():
+            await conn.executemany(
                 """INSERT INTO objects
                        (city, osm_id, name, lat, lon, address, source_name, image)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                    ON CONFLICT (city, osm_id) DO NOTHING""",
-                city,
-                obj["osm_id"],
-                obj.get("name", ""),
-                obj.get("lat"),
-                obj.get("lon"),
-                obj.get("address", ""),
-                obj.get("source_name", "Urban3P"),
-                obj.get("image", ""),
+                rows,
             )
-            # asyncpg returns "INSERT 0 N"
-            if result.endswith(" 1"):
-                saved += 1
-    return saved
+    return len(rows)
 
 
 async def get_object_count(pool: asyncpg.Pool, city: str) -> int:

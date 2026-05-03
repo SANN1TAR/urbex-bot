@@ -1,15 +1,16 @@
 import os
-import sys
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
 load_dotenv()
+
 
 @dataclass
 class Config:
     telegram_token: str
     tavily_api_key: str
     database_url: str
+
 
 def get_config() -> Config:
     missing = []
@@ -25,9 +26,10 @@ def get_config() -> Config:
         missing.append("DATABASE_URL")
 
     if missing:
-        print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
-        print("Set them in .env file or environment before starting the bot.")
-        sys.exit(1)
+        raise EnvironmentError(
+            f"Missing required environment variables: {', '.join(missing)}\n"
+            "Set them in .env file or environment before starting the bot."
+        )
 
     return Config(
         telegram_token=token,

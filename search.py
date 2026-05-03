@@ -3,6 +3,7 @@ import hashlib
 import logging
 import re
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import asyncpg
 import httpx
@@ -16,10 +17,58 @@ from database import (
 logger = logging.getLogger(__name__)
 
 _tavily_client: TavilyClient | None = None
+_http_client: httpx.AsyncClient | None = None
+
+# Per-city locks to prevent concurrent duplicate fetches
+_city_fetch_locks: dict[str, asyncio.Lock] = {}
+
+# SSRF protection: only scrape these hosts
+_ALLOWED_SCRAPE_HOSTS = {"urban3p.ru", "www.urban3p.ru", "urban3p.com", "www.urban3p.com"}
+# Image URLs must come from these hosts
+_ALLOWED_IMAGE_HOSTS = {
+    "img04.urban3p.ru", "img03.urban3p.ru", "img02.urban3p.ru",
+    "img.urban3p.ru", "img04.urban3p.com",
+}
+
+# Force refresh when object count is below this threshold
+_MIN_OBJECTS_THRESHOLD = 20
+
+_CATALOG_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Accept": "text/html,application/xhtml+xml",
+}
+
 
 def init_search(tavily_api_key: str) -> None:
-    global _tavily_client
+    global _tavily_client, _http_client
     _tavily_client = TavilyClient(api_key=tavily_api_key)
+    _http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
+        limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        headers=_CATALOG_HEADERS,
+        follow_redirects=False,
+    )
+
+
+async def close_http_client() -> None:
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+        _http_client = None
+
+
+def _is_safe_url(url: str, allowed_hosts: set[str]) -> bool:
+    """Return True only if URL scheme is http/https and hostname is in the allowlist."""
+    try:
+        p = urlparse(url)
+        return p.scheme in ("http", "https") and (p.hostname or "") in allowed_hosts
+    except Exception:
+        return False
+
 
 SEARCH_TEMPLATES = [
     "заброшенный завод {city} site:urban3p.ru",
@@ -32,7 +81,6 @@ SEARCH_TEMPLATES = [
     "заброшенная {city} site:urban3p.com",
 ]
 
-# Search terms per city for catalog filtering
 CITY_SEARCH_TERMS: dict[str, list[str]] = {
     "Москва": ["москва", "moscow", "г. москва"],
     "Московская область": ["московская область", "подмосковье", "московск"],
@@ -53,7 +101,6 @@ CITY_SEARCH_TERMS: dict[str, list[str]] = {
     "Астана": ["астана", "нур-султан", "акмолинская"],
 }
 
-# Bounding boxes for cities [west,south,east,north] — for OSM queries
 CITY_BBOXES: dict[str, str] = {
     "Москва": "36.8,55.4,38.0,56.1",
     "Московская область": "35.9,54.7,39.5,56.9",
@@ -96,18 +143,6 @@ _ADDRESS_RE = re.compile(
     r'\s+[\w\s]+,?\s*(?:д\.?\s*\d+[\w/]*)?',
     re.IGNORECASE
 )
-
-_CATALOG_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ru-RU,ru;q=0.9",
-    "Accept": "text/html,application/xhtml+xml",
-}
-
-# Force refresh when object count is below this threshold
-_MIN_OBJECTS_THRESHOLD = 20
 
 
 def _in_cis_bounds(lat: float, lon: float) -> bool:
@@ -159,6 +194,15 @@ def _parse_coords(coords_str: str) -> tuple[float, float] | None:
         return None
 
 
+def _safe_image_url(url: str) -> str:
+    """Return url if it's from an allowed image host, else empty string."""
+    if not url:
+        return ""
+    if _is_safe_url(url, _ALLOWED_IMAGE_HOSTS):
+        return url
+    return ""
+
+
 def _parse_catalog_page(html: str) -> list[dict]:
     """Parse urban3p.ru/objects catalog page into list of {id, name, region}."""
     seen: set[str] = set()
@@ -173,19 +217,18 @@ def _parse_catalog_page(html: str) -> list[dict]:
         pos = m.start()
         window = html[pos: pos + 2000]
 
-        # Name: anchor text for the object link (use [\s\S] to handle multiline anchor text)
+        # Name: anchor text — [^<] avoids catastrophic backtracking and is correct
+        # (anchor text cannot contain < in valid HTML)
         name_m = re.search(
-            r'href="/object' + obj_id + r'"[^>]*>([\s\S]{3,100}?)</a>', window
+            r'href="/object' + obj_id + r'"[^>]*>([^<]{3,100})</a>', window
         )
         if not name_m:
-            # Fallback: img alt attribute
             name_m = re.search(r'alt="([^"]{3,100})"', window[:600])
         name = name_m.group(1).strip() if name_m else ""
         name = re.sub(r'\s+', ' ', name).strip()
         if len(name) < 3 or JUNK_RE.search(name):
             continue
 
-        # Region: look for ?region_id= link text
         region_m = re.search(r'region_id=\d+"[^>]*>([^<]+)</a>', window)
         region = region_m.group(1).strip() if region_m else ""
 
@@ -194,11 +237,16 @@ def _parse_catalog_page(html: str) -> list[dict]:
     return items
 
 
-async def _find_region_id(city: str, client: httpx.AsyncClient) -> str | None:
-    """Discover urban3p region_id for city by scanning first catalog page."""
+async def _find_region_id(city: str) -> str | None:
+    """Discover urban3p region_id for city from catalog first page."""
+    if _http_client is None:
+        return None
     search_terms = CITY_SEARCH_TERMS.get(city, [city.lower()])
     try:
-        resp = await client.get("https://urban3p.ru/objects/", params={"page": 1})
+        resp = await _http_client.get(
+            "https://urban3p.ru/objects/",
+            params={"page": 1},
+        )
         if resp.status_code != 200:
             return None
         for m in re.finditer(r'region_id=(\d+)"[^>]*>([^<]+)</a>', resp.text):
@@ -208,45 +256,41 @@ async def _find_region_id(city: str, client: httpx.AsyncClient) -> str | None:
                 logger.info(f"Discovered region_id={region_id} for {city} ({region_name})")
                 return region_id
     except Exception as e:
-        logger.debug(f"Region ID discovery failed for {city}: {e}")
+        logger.debug(f"Region ID discovery failed for {city}: {type(e).__name__}")
     return None
 
 
 async def _fetch_urban3p_catalog(city: str, pool: asyncpg.Pool) -> list[dict]:
     """Paginate urban3p.ru catalog and collect objects matching the city."""
+    if _http_client is None:
+        return []
     search_terms = CITY_SEARCH_TERMS.get(city, [city.lower()])
     objects: list[dict] = []
     seen_ids: set[str] = set()
 
-    async with httpx.AsyncClient(
-        timeout=15, headers=_CATALOG_HEADERS, follow_redirects=True
-    ) as client:
-        # Try to get a region_id filter for efficient pagination
-        region_id = await _find_region_id(city, client)
-        max_pages = 100 if region_id else 30
-        base_params: dict = {}
-        if region_id:
-            base_params["region_id"] = region_id
+    region_id = await _find_region_id(city)
+    max_pages = 100 if region_id else 30
+    base_params: dict = {}
+    if region_id:
+        base_params["region_id"] = region_id
 
-        consecutive_empty = 0
-        for page in range(1, max_pages + 1):
-            if consecutive_empty >= 3:
+    consecutive_empty = 0
+    for page in range(1, max_pages + 1):
+        if consecutive_empty >= 3:
+            break
+        try:
+            resp = await _http_client.get(
+                "https://urban3p.ru/objects/",
+                params={**base_params, "page": page},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"urban3p catalog page {page}: HTTP {resp.status_code}")
                 break
-            try:
-                resp = await client.get(
-                    "https://urban3p.ru/objects/",
-                    params={**base_params, "page": page},
-                )
-                if resp.status_code != 200:
-                    logger.warning(f"urban3p catalog page {page}: HTTP {resp.status_code}")
-                    break
 
-                cards = _parse_catalog_page(resp.text)
-                if not cards:
-                    consecutive_empty += 1
-                    await asyncio.sleep(0.5)
-                    continue
+            cards = _parse_catalog_page(resp.text)
 
+            if cards:
+                consecutive_empty = 0
                 matched = 0
                 for card in cards:
                     obj_id = card["id"]
@@ -254,7 +298,6 @@ async def _fetch_urban3p_catalog(city: str, pool: asyncpg.Pool) -> list[dict]:
                     if osm_id in seen_ids:
                         continue
 
-                    # If no region filter, match locally by city name
                     if not region_id:
                         combined = (card["region"] + " " + card["name"]).lower()
                         if not any(t in combined for t in search_terms):
@@ -272,19 +315,16 @@ async def _fetch_urban3p_catalog(city: str, pool: asyncpg.Pool) -> list[dict]:
                     })
                     matched += 1
 
-                # Stop early only when the page returned no cards at all
-                if cards:
-                    consecutive_empty = 0
-                    if matched:
-                        logger.info(f"urban3p catalog p{page}: +{matched} for {city}")
-                else:
-                    consecutive_empty += 1
-
-                await asyncio.sleep(0.3)
-
-            except Exception as e:
-                logger.warning(f"urban3p catalog page {page}: {e}")
+                if matched:
+                    logger.info(f"urban3p catalog p{page}: +{matched} for {city}")
+            else:
                 consecutive_empty += 1
+
+            await asyncio.sleep(0.3)
+
+        except Exception as e:
+            logger.warning(f"urban3p catalog page {page}: {type(e).__name__}")
+            consecutive_empty += 1
 
     logger.info(f"urban3p catalog total: {len(objects)} objects for {city}")
     return objects
@@ -294,6 +334,8 @@ async def _fetch_from_osm(city: str) -> list[dict]:
     bbox = CITY_BBOXES.get(city)
     if not bbox:
         logger.info(f"No OSM bbox configured for city: {city}")
+        return []
+    if _http_client is None:
         return []
 
     osm_filter = (
@@ -305,25 +347,25 @@ async def _fetch_from_osm(city: str) -> list[dict]:
     )
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
-                "https://api.ohsome.org/v1/elements/centroid",
-                params={
-                    "bboxes": bbox,
-                    "filter": osm_filter,
-                    "time": "2024-01-01",
-                    "properties": "tags",
-                },
-            )
-            if resp.status_code != 200:
-                logger.warning(f"ohsome API returned {resp.status_code} for {city}")
-                return []
-            data = resp.json()
+        resp = await _http_client.get(
+            "https://api.ohsome.org/v1/elements/centroid",
+            params={
+                "bboxes": bbox,
+                "filter": osm_filter,
+                "time": "2024-01-01",
+                "properties": "tags",
+            },
+            timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0),
+        )
+        if resp.status_code != 200:
+            logger.warning(f"ohsome API returned {resp.status_code} for {city}")
+            return []
+        data = resp.json()
     except httpx.TimeoutException:
         logger.warning(f"ohsome API timeout for {city}")
         return []
     except Exception as e:
-        logger.error(f"ohsome API error for {city}: {e}")
+        logger.error(f"ohsome API error for {city}: {type(e).__name__}")
         return []
 
     objects = []
@@ -393,33 +435,40 @@ def _build_osm_name(tags: dict, osm_id: str) -> str:
 
 
 async def _scrape_object_page(url: str) -> dict:
-    if not url or "urban3p" not in url:
+    """Scrape an urban3p object page for image, address, and coordinates."""
+    if not _is_safe_url(url, _ALLOWED_SCRAPE_HOSTS):
+        return {}
+    if _http_client is None:
         return {}
     try:
-        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0"}) as client:
-            resp = await client.get(url, follow_redirects=True)
-            if resp.status_code != 200:
-                return {}
-            html = resp.text
+        resp = await _http_client.get(
+            url,
+            timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
+        )
+        if resp.status_code != 200:
+            return {}
+        html = resp.text
 
+        # Build image from object ID — og:image is absent on urban3p
         image = ""
-        # For urban3p, build image URL from object ID (og:image is absent)
         id_m = re.search(r'/object(\d+)', url)
         if id_m:
             image = f"https://img04.urban3p.ru/up/o/{id_m.group(1)}/preview.jpg"
 
-        # Fallback: og:image meta tag
         if not image:
-            img = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
+            img = re.search(
+                r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html
+            )
             if not img:
-                img = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html)
-            image = img.group(1) if img else ""
+                img = re.search(
+                    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html
+                )
+            if img:
+                image = _safe_image_url(img.group(1))
 
-        # Address: street address regex
         addr = _ADDRESS_RE.search(html)
         address = re.sub(r'\s+', ' ', addr.group(0)).strip() if addr else ""
 
-        # Fallback address: region from urban3p region_id link
         if not address:
             region_m = re.search(r'region_id=\d+"[^>]*>([^<]+)</a>', html)
             if region_m:
@@ -440,21 +489,27 @@ async def _scrape_object_page(url: str) -> dict:
                     lat, lon = parsed
                     break
 
-        logger.info(f"Scraped {url[-40:]}: image={'yes' if image else 'no'}, lat={lat}, address={address or 'none'}")
+        logger.info(
+            f"Scraped {url[-40:]}: image={'yes' if image else 'no'}, "
+            f"lat={lat}, address={address or 'none'}"
+        )
         return {"image": image, "lat": lat, "lon": lon, "address": address}
 
-    except httpx.TimeoutException as e:
-        logger.warning(f"Timeout scraping {url}: {e}")
+    except httpx.TimeoutException:
+        logger.warning(f"Timeout scraping {url[-60:]}")
         return {}
-    except httpx.ConnectError as e:
-        logger.warning(f"Connection error scraping {url}: {e}")
+    except httpx.ConnectError:
+        logger.warning(f"Connection error scraping {url[-60:]}")
         return {}
     except Exception as e:
-        logger.error(f"Unexpected error scraping {url}: {e}")
+        logger.error(f"Unexpected error scraping {url[-60:]}: {type(e).__name__}")
         return {}
 
 
 async def _tavily_search_one(query: str) -> list:
+    if _tavily_client is None:
+        logger.warning("Tavily client not initialized")
+        return []
     try:
         data = await asyncio.to_thread(
             lambda: _tavily_client.search(
@@ -468,7 +523,7 @@ async def _tavily_search_one(query: str) -> list:
         logger.info(f"Tavily '{query[:50]}': {len(results)} results")
         return results
     except Exception as e:
-        logger.warning(f"Tavily error for '{query[:40]}': {e}")
+        logger.warning(f"Tavily error for '{query[:40]}': {type(e).__name__}")
         return []
 
 
@@ -503,6 +558,8 @@ async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
             continue
         seen_urls.add(url)
 
+        if not _is_safe_url(url, _ALLOWED_SCRAPE_HOSTS):
+            continue
         if "urban3p" in url and not re.search(r'/object\d+', url):
             continue
 
@@ -541,6 +598,8 @@ async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
         if await is_duplicate(pool, city, lat, lon):
             continue
 
+        # Use blake2b for non-security dedup ID (faster than MD5, no broken algorithm warning)
+        osm_id = "t_" + hashlib.blake2b(url.encode(), digest_size=8).hexdigest()
         objects.append({
             "name": name,
             "lat": lat,
@@ -548,7 +607,7 @@ async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
             "address": address,
             "source_name": "Urban3P",
             "image": image,
-            "osm_id": "t_" + hashlib.md5(url.encode()).hexdigest()[:16],
+            "osm_id": osm_id,
         })
         seen_names.add(norm)
 
@@ -601,7 +660,6 @@ async def search_objects(
         or (datetime.now(timezone.utc) - last_fetched).days >= CACHE_REFRESH_DAYS
     )
 
-    # Force refresh if DB has too few objects regardless of TTL
     if not needs_refresh:
         count = await get_object_count(pool, city)
         if count < _MIN_OBJECTS_THRESHOLD:
@@ -609,16 +667,29 @@ async def search_objects(
             needs_refresh = True
 
     if needs_refresh:
-        logger.info(f"Refreshing archive for {city} (last: {last_fetched})")
-        try:
-            new_objects = await _fetch_from_web(city, pool)
-            if new_objects:
-                saved = await save_objects(pool, city, new_objects)
-                logger.info(f"Added {saved} new objects to archive for {city}")
-                await update_city_fetched(pool, city)
-            else:
-                logger.warning(f"Fetch returned 0 objects for {city} — not updating fetch timestamp")
-        except Exception as e:
-            logger.error(f"Failed to fetch from web for {city}: {e}")
+        # Per-city lock prevents concurrent duplicate fetches (background loop + user tap)
+        lock = _city_fetch_locks.setdefault(city, asyncio.Lock())
+        if not lock.locked():
+            async with lock:
+                # Re-check after acquiring lock (another coroutine may have just refreshed)
+                last_fetched = await get_city_last_fetched(pool, city)
+                count = await get_object_count(pool, city)
+                still_needs = (
+                    last_fetched is None
+                    or (datetime.now(timezone.utc) - last_fetched).days >= CACHE_REFRESH_DAYS
+                    or count < _MIN_OBJECTS_THRESHOLD
+                )
+                if still_needs:
+                    logger.info(f"Refreshing archive for {city} (last: {last_fetched})")
+                    try:
+                        new_objects = await _fetch_from_web(city, pool)
+                        if new_objects:
+                            saved = await save_objects(pool, city, new_objects)
+                            logger.info(f"Upserted up to {saved} objects for {city} (new = actual inserts, dupes skipped)")
+                            await update_city_fetched(pool, city)
+                        else:
+                            logger.warning(f"Fetch returned 0 objects for {city}")
+                    except Exception as e:
+                        logger.error(f"Failed to fetch for {city}: {type(e).__name__}: {e}")
 
     return await get_objects(pool, city, shown_ids, limit=3)
