@@ -1,11 +1,8 @@
-# Search for abandoned objects via Tavily + urban3p.ru scraping
-# Returns objects with verified location (lat/lon or address) only
-
 import asyncio
 import hashlib
 import logging
 import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import asyncpg
 import httpx
@@ -13,7 +10,7 @@ from tavily import TavilyClient
 
 from database import (
     get_objects, save_objects, get_city_last_fetched,
-    update_city_fetched, is_duplicate, CACHE_REFRESH_DAYS,
+    update_city_fetched, is_duplicate, get_object_count, CACHE_REFRESH_DAYS,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,7 +21,6 @@ def init_search(tavily_api_key: str) -> None:
     global _tavily_client
     _tavily_client = TavilyClient(api_key=tavily_api_key)
 
-# Search query templates — {city} replaced at runtime
 SEARCH_TEMPLATES = [
     "заброшенный завод {city} site:urban3p.ru",
     "заброшенная больница {city} site:urban3p.ru",
@@ -63,6 +59,16 @@ JUNK_RE = re.compile(
     r'заброшенные места|лучшие заброшки|самые|обзор|путешест)',
     re.IGNORECASE
 )
+
+_ADDRESS_RE = re.compile(
+    r'(?:ул\.|улица|пер\.|переулок|пр\.|проспект|ш\.|шоссе|бул\.|бульвар|пл\.|площадь)'
+    r'\s+[\w\s]+,?\s*(?:д\.?\s*\d+[\w/]*)?',
+    re.IGNORECASE
+)
+
+
+def _in_cis_bounds(lat: float, lon: float) -> bool:
+    return 40 <= lat <= 80 and 20 <= lon <= 180
 
 
 def _normalize_name(name: str) -> str:
@@ -105,8 +111,7 @@ def _parse_coords(coords_str: str) -> tuple[float, float] | None:
     try:
         lat = float(m.group(1))
         lon = float(m.group(2))
-        # Sanity check: Russia/CIS latitude 40-80, longitude 20-180
-        if 40 <= lat <= 80 and 20 <= lon <= 180:
+        if _in_cis_bounds(lat, lon):
             return (lat, lon)
         return None
     except ValueError:
@@ -114,7 +119,6 @@ def _parse_coords(coords_str: str) -> tuple[float, float] | None:
 
 
 async def _get_coords_nominatim(name: str, city: str) -> tuple[float, float] | None:
-    """Geocode by name via Nominatim. Returns (lat, lon) only if within Russia/CIS bounds."""
     clean = re.sub(r'заброш\w+\s*', '', name, flags=re.IGNORECASE)
     clean = re.sub(r'\([^)]*\)', '', clean).strip()
     queries = [f"{clean}, {city}, Россия", f"{name}, {city}, Россия"]
@@ -184,14 +188,12 @@ async def _fetch_from_osm(city: str) -> list[dict]:
             continue
 
         lon, lat = float(coords[0]), float(coords[1])
-        # Validate coordinates are within Russia/CIS
-        if not (40 <= lat <= 80 and 20 <= lon <= 180):
+        if not _in_cis_bounds(lat, lon):
             continue
 
         tags = props.get("tags", {})
         osm_id = props.get("@osmId", "")
 
-        # Build name from tags
         name = (
             tags.get("name")
             or tags.get("abandoned:name")
@@ -221,7 +223,6 @@ async def _fetch_from_osm(city: str) -> list[dict]:
 
 
 def _build_osm_name(tags: dict, osm_id: str) -> str:
-    """Build a human-readable name from OSM tags when 'name' tag is missing."""
     type_map = {
         "factory": "Заброшенный завод",
         "industrial": "Заброшенное производство",
@@ -245,7 +246,6 @@ def _build_osm_name(tags: dict, osm_id: str) -> str:
 
 
 async def _scrape_object_page(url: str) -> dict:
-    """Scrape urban3p.ru object page for image, coords, address."""
     if not url or "urban3p" not in url:
         return {}
     try:
@@ -255,29 +255,23 @@ async def _scrape_object_page(url: str) -> dict:
                 return {}
             html = resp.text
 
-        # OG image
         img = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
         if not img:
             img = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html)
         image = img.group(1) if img else ""
 
-        # Address from page text
-        addr = re.search(
-            r'(?:ул\.|улица|пер\.|переулок|пр\.|проспект|ш\.|шоссе|бул\.|бульвар|пл\.|площадь)\s+[\w\s]+,?\s*д\.?\s*\d+[\w/]*',
-            html, re.IGNORECASE
-        )
+        addr = _ADDRESS_RE.search(html)
         address = re.sub(r'\s+', ' ', addr.group(0)).strip() if addr else ""
 
-        # Coordinates: search in HTML (JSON data, JS variables, data attributes)
         lat, lon = None, None
         coord_patterns = [
-            # JSON: "lat":55.123,"lon":37.456 or "latitude":55.123,"longitude":37.456
+            # JSON: "lat":55.123,"lon":37.456
             r'"lat(?:itude)?"\s*:\s*"?([4-7][0-9]\.[0-9]+)"?[^}]*?"lo?n(?:gitude)?"\s*:\s*"?([2-9][0-9]\.[0-9]+)"?',
             # JS: lat: 55.123, lon: 37.456
             r'\blat(?:itude)?\s*[:=]\s*([4-7][0-9]\.[0-9]+).*?\blo?n(?:gitude)?\s*[:=]\s*([2-9][0-9]\.[0-9]+)',
             # data-lat="55.123" data-lon="37.456"
             r'data-lat[^=]*=\s*["\']([4-7][0-9]\.[0-9]+)["\'].*?data-lo?n[^=]*=\s*["\']([2-9][0-9]\.[0-9]+)["\']',
-            # LatLng(55.123, 37.456) or [55.123, 37.456]
+            # LatLng(55.123, 37.456)
             r'(?:LatLng|center)\s*[\(\[]\s*([4-7][0-9]\.[0-9]+)\s*,\s*([2-9][0-9]\.[0-9]+)',
         ]
         for pattern in coord_patterns:
@@ -304,7 +298,6 @@ async def _scrape_object_page(url: str) -> dict:
 
 
 async def _tavily_search_one(query: str) -> list:
-    """Run one Tavily query, return results list."""
     try:
         data = await asyncio.to_thread(
             lambda: _tavily_client.search(
@@ -323,14 +316,16 @@ async def _tavily_search_one(query: str) -> list:
 
 
 async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
-    """Fetch objects via multiple parallel Tavily queries. Returns only objects with location."""
     if _tavily_client is None:
         raise RuntimeError("search not initialized — call init_search() first")
 
     queries = [t.format(city=city) for t in SEARCH_TEMPLATES]
-    all_results_lists = await asyncio.gather(*[_tavily_search_one(q) for q in queries])
+    all_results_lists, osm_objects = await asyncio.gather(
+        asyncio.gather(*[_tavily_search_one(q) for q in queries]),
+        _fetch_from_osm(city),
+    )
     all_results = [r for sublist in all_results_lists for r in sublist]
-    logger.info(f"Total raw results for {city}: {len(all_results)}")
+    logger.info(f"Total raw Tavily results for {city}: {len(all_results)}, OSM: {len(osm_objects)}")
 
     objects = []
     seen_names: set[str] = set()
@@ -366,16 +361,13 @@ async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
         address = page_data.get("address", "")
         image = page_data.get("image", "")
 
-        # Fallback 1: address from Tavily content snippet
+        # Fallback: address from Tavily content snippet
         if lat is None and not address:
-            addr_match = re.search(
-                r'(?:ул\.|улица|пер\.|проспект|шоссе|бульвар|площадь)\s+[\w\s]+,?\s*(?:д\.?\s*\d+[\w/]*)?',
-                content, re.IGNORECASE
-            )
+            addr_match = _ADDRESS_RE.search(content)
             if addr_match:
                 address = re.sub(r'\s+', ' ', addr_match.group(0)).strip()
 
-        # Fallback 2: Nominatim geocoding
+        # Fallback: Nominatim geocoding
         if lat is None and not address:
             coords = await _get_coords_nominatim(name, city)
             if coords:
@@ -409,20 +401,14 @@ async def _fetch_from_web(city: str, pool: asyncpg.Pool) -> list[dict]:
         })
         seen_names.add(norm)
 
-    # Also fetch from OpenStreetMap for cities where we have bbox
-    osm_objects = await _fetch_from_osm(city)
-    logger.info(f"OSM returned {len(osm_objects)} raw objects for {city}")
-
     for obj in osm_objects:
-        lat = obj["lat"]
-        lon = obj["lon"]
-        norm = _normalize_name(obj["name"])
-
-        if norm in seen_names:
-            continue
         if not obj["name"]:
             continue
+        norm = _normalize_name(obj["name"])
+        if norm in seen_names:
+            continue
 
+        lat, lon = obj["lat"], obj["lon"]
         coord_key = (round(lat, 3), round(lon, 3))
         if coord_key in seen_coords:
             continue
@@ -445,19 +431,15 @@ async def search_objects(
     shown_ids: set[int],
 ) -> list[dict]:
     """Main entry point. Returns up to 3 objects not yet shown to user."""
-    # Check if archive needs refreshing
     last_fetched = await get_city_last_fetched(pool, city)
     needs_refresh = (
         last_fetched is None
         or (datetime.now(timezone.utc) - last_fetched).days >= CACHE_REFRESH_DAYS
     )
 
-    # Also refresh if DB is empty for this city (previous fetch may have yielded 0 objects)
-    if not needs_refresh:
-        existing = await pool.fetchval("SELECT COUNT(*) FROM objects WHERE city = $1", city)
-        if existing == 0:
-            logger.info(f"City {city} has 0 objects in archive — forcing refresh")
-            needs_refresh = True
+    if not needs_refresh and await get_object_count(pool, city) == 0:
+        logger.info(f"City {city} has 0 objects in archive — forcing refresh")
+        needs_refresh = True
 
     if needs_refresh:
         logger.info(f"Refreshing archive for {city} (last: {last_fetched})")
@@ -466,12 +448,10 @@ async def search_objects(
             if new_objects:
                 saved = await save_objects(pool, city, new_objects)
                 logger.info(f"Added {saved} new objects to archive for {city}")
-                await update_city_fetched(pool, city)  # only mark fetched if we got objects
+                await update_city_fetched(pool, city)
             else:
                 logger.warning(f"Fetch returned 0 objects for {city} — not updating fetch timestamp")
         except Exception as e:
             logger.error(f"Failed to fetch from web for {city}: {e}")
-            # Fall through to DB — return whatever is cached
 
-    # Get from archive — strictly respect shown_ids (no auto-reset)
     return await get_objects(pool, city, shown_ids, limit=3)

@@ -20,6 +20,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _pool: asyncpg.Pool | None = None
+# In-memory guard: prevents duplicate responses when user double-taps fast
+_loading_users: set[int] = set()
 
 DISCLAIMER = (
     "⚠️ <b>Стоп, читай сюда.</b>\n\n"
@@ -37,7 +39,6 @@ VPN_NOTE = (
 
 STALE_NOTE = "⚡ Не серчай, инфа может быть устаревшей. Перед вылазкой перепроверь."
 
-# Main screen keyboard
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🏚️ Заброшка")],
@@ -46,7 +47,6 @@ MAIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# Keyboard while browsing — "Заброшка" = next, "Завершить" = end session
 BROWSING_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🏚️ Заброшка")],
@@ -56,7 +56,8 @@ BROWSING_KB = ReplyKeyboardMarkup(
 )
 
 MENU_BUTTONS = {"🏚️ Заброшка", "🏙️ Сменить город", "✖️ Завершить поиск"}
-OBJ_TYPE_NAMES = {"zabroshka": "заброшки"}
+OBJ_TYPE = "zabroshka"
+OBJ_TYPE_NAMES = {OBJ_TYPE: "заброшки"}
 
 CITY_ALIASES = {
     "мск": "Москва", "москва": "Москва",
@@ -92,6 +93,10 @@ def _format_obj(obj: dict) -> str:
     else:
         location = ""
     return f"<b>{obj.get('name', 'Без названия')}</b>{location}"
+
+
+def _serialize_cache(objects: list[dict]) -> str:
+    return json.dumps([dict(o) for o in objects], ensure_ascii=False)
 
 
 class Reg(StatesGroup):
@@ -173,7 +178,6 @@ async def reg_city(message: Message, state: FSMContext):
 
 
 async def _send_one(message: Message, obj: dict):
-    """Send one object card. No inline buttons — navigation via reply keyboard."""
     image = obj.get("image", "")
     if image:
         try:
@@ -192,52 +196,48 @@ async def _send_one(message: Message, obj: dict):
 
 
 async def _show_next(message: Message, state: FSMContext) -> None:
-    """Show next object from cache, or fetch more from DB."""
-    data = await state.get_data()
-    if data.get("loading"):
-        return
-    await state.update_data(loading=True)
-    cache = json.loads(data["cache"])
-    idx = data["idx"] + 1
-
-    if idx < len(cache):
-        await state.update_data(idx=idx, loading=False)
-        await _send_one(message, cache[idx])
-        return
-
     uid = message.from_user.id
-    shown_ids = await get_shown_ids(_pool, uid)
-    await message.answer("Ищу ещё... 🔍")
-    objects = await search_objects(_pool, data["obj_type"], data["city"], shown_ids)
-
-    if not objects:
-        await state.clear()
-        await message.answer(
-            "Показал всё что знаю 🏁\n\n"
-            "Нажми 🏚️ <b>Заброшка</b> чтобы начать заново.",
-            parse_mode="HTML",
-            reply_markup=MAIN_KB,
-        )
+    if uid in _loading_users:
         return
+    _loading_users.add(uid)
+    try:
+        data = await state.get_data()
+        cache = json.loads(data["cache"])
+        idx = data["idx"] + 1
 
-    new_ids = [o["id"] for o in objects]
-    await mark_shown(_pool, uid, new_ids)
-    await state.update_data(
-        cache=json.dumps([dict(o) for o in objects], ensure_ascii=False),
-        idx=0,
-        loading=False,
-    )
-    await _send_one(message, objects[0])
+        if idx < len(cache):
+            await state.update_data(idx=idx)
+            await _send_one(message, cache[idx])
+            return
+
+        shown_ids = await get_shown_ids(_pool, uid)
+        await message.answer("Ищу ещё... 🔍")
+        objects = await search_objects(_pool, data["obj_type"], data["city"], shown_ids)
+
+        if not objects:
+            await state.clear()
+            await message.answer(
+                "Показал всё что знаю 🏁\n\n"
+                "Нажми 🏚️ <b>Заброшка</b> чтобы начать заново.",
+                parse_mode="HTML",
+                reply_markup=MAIN_KB,
+            )
+            return
+
+        new_ids = [o["id"] for o in objects]
+        await mark_shown(_pool, uid, new_ids)
+        await state.update_data(cache=_serialize_cache(objects), idx=0)
+        await _send_one(message, objects[0])
+    finally:
+        _loading_users.discard(uid)
 
 
 async def _start_session(message: Message, state: FSMContext, obj_type: str, city: str):
-    """Start a fresh browsing session."""
     uid = message.from_user.id
     await reset_shown(_pool, uid)
-    shown_ids = await get_shown_ids(_pool, uid)  # empty after reset
 
     await message.answer(f"Ща пробью {OBJ_TYPE_NAMES[obj_type]} в {city}... 🔍")
-    objects = await search_objects(_pool, obj_type, city, shown_ids)
+    objects = await search_objects(_pool, obj_type, city, set())
 
     if not objects:
         await state.clear()
@@ -254,31 +254,27 @@ async def _start_session(message: Message, state: FSMContext, obj_type: str, cit
     await state.update_data(
         obj_type=obj_type,
         city=city,
-        cache=json.dumps([dict(o) for o in objects], ensure_ascii=False),
+        cache=_serialize_cache(objects),
         idx=0,
     )
-    # Switch keyboard to browsing mode
     await message.answer("Нашёл. Листай:", reply_markup=BROWSING_KB)
     await _send_one(message, objects[0])
 
 
-# "Заброшка" during active session → next object
 @dp.message(F.text == "🏚️ Заброшка", Browsing.active)
 async def handle_next_in_session(message: Message, state: FSMContext):
     await _show_next(message, state)
 
 
-# "Заброшка" on main screen → start new session
 @dp.message(F.text == "🏚️ Заброшка")
 async def handle_zabroshka(message: Message, state: FSMContext):
     user = await _require_user(message)
     if not user:
         return
     await state.clear()
-    await _start_session(message, state, "zabroshka", user["city"])
+    await _start_session(message, state, OBJ_TYPE, user["city"])
 
 
-# "Завершить поиск" → end session, back to main screen
 @dp.message(F.text == "✖️ Завершить поиск")
 async def handle_stop_browsing(message: Message, state: FSMContext):
     await state.clear()
@@ -295,16 +291,16 @@ async def handle_change_city(message: Message, state: FSMContext):
 async def _refresh_cache_loop(pool: asyncpg.Pool) -> None:
     while True:
         try:
-            await asyncio.sleep(24 * 3600)
             async with pool.acquire() as conn:
                 rows = await conn.fetch("SELECT DISTINCT city FROM users")
             cities = [r["city"] for r in rows]
             for city in cities:
                 try:
                     logger.info(f"Background refresh for {city}")
-                    await search_objects(pool, "zabroshka", city, set())
+                    await search_objects(pool, OBJ_TYPE, city, set())
                 except Exception as e:
                     logger.error(f"Background refresh failed for {city}: {e}")
+            await asyncio.sleep(24 * 3600)
         except asyncio.CancelledError:
             break
         except Exception as e:

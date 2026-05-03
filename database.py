@@ -81,26 +81,15 @@ async def get_objects(
     shown_ids: set[int],
     limit: int = 3,
 ) -> list[dict]:
-    shown_list = list(shown_ids) if shown_ids else []
     async with pool.acquire() as conn:
-        if shown_list:
-            rows = await conn.fetch(
-                """SELECT id, name, lat, lon, address, image, source_name
-                   FROM objects
-                   WHERE city = $1 AND NOT (id = ANY($2::int[]))
-                   ORDER BY RANDOM()
-                   LIMIT $3""",
-                city, shown_list, limit,
-            )
-        else:
-            rows = await conn.fetch(
-                """SELECT id, name, lat, lon, address, image, source_name
-                   FROM objects
-                   WHERE city = $1
-                   ORDER BY RANDOM()
-                   LIMIT $2""",
-                city, limit,
-            )
+        rows = await conn.fetch(
+            """SELECT id, name, lat, lon, address, image, source_name
+               FROM objects
+               WHERE city = $1 AND NOT (id = ANY($2::int[]))
+               ORDER BY RANDOM()
+               LIMIT $3""",
+            city, list(shown_ids), limit,
+        )
     return [
         {
             "id": row["id"],
@@ -125,7 +114,7 @@ async def save_objects(pool: asyncpg.Pool, city: str, objects: list[dict]) -> in
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                    ON CONFLICT (city, osm_id) DO NOTHING""",
                 city,
-                obj.get("osm_id") or obj.get("name"),
+                obj["osm_id"],
                 obj.get("name", ""),
                 obj.get("lat"),
                 obj.get("lon"),
@@ -133,10 +122,17 @@ async def save_objects(pool: asyncpg.Pool, city: str, objects: list[dict]) -> in
                 obj.get("source_name", "Urban3P"),
                 obj.get("image", ""),
             )
-            # asyncpg returns command tag like "INSERT 0 1" (inserted) or "INSERT 0 0" (conflict)
+            # asyncpg returns "INSERT 0 N"
             if result.endswith(" 1"):
                 saved += 1
     return saved
+
+
+async def get_object_count(pool: asyncpg.Pool, city: str) -> int:
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM objects WHERE city = $1", city
+        )
 
 
 async def get_city_last_fetched(pool: asyncpg.Pool, city: str) -> datetime | None:
