@@ -11,7 +11,7 @@ from tavily import TavilyClient
 
 from database import (
     get_objects, save_objects, get_city_last_fetched,
-    update_city_fetched, is_duplicate, get_object_count, CACHE_REFRESH_DAYS,
+    update_city_fetched, is_duplicate, get_located_object_count, CACHE_REFRESH_DAYS,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,8 +30,23 @@ _ALLOWED_IMAGE_HOSTS = {
     "img.urban3p.ru", "img04.urban3p.com",
 }
 
-# Force refresh when object count is below this threshold
+# Force refresh when located object count is below this threshold
 _MIN_OBJECTS_THRESHOLD = 20
+
+# Nominatim geocoding settings (max 1 req/sec per usage policy)
+_NOMINATIM_SEM = asyncio.Semaphore(1)
+_GEOCODE_LIMIT = 20  # max Nominatim calls per city per refresh (~22 seconds)
+
+# Nominatim result types that are too coarse to be useful as a location
+_NOMINATIM_REJECT_TYPES = {
+    "city", "town", "village", "hamlet", "county", "state", "country",
+    "administrative", "municipality", "region", "boundary",
+}
+# Nominatim classes that indicate a useful specific location
+_NOMINATIM_ACCEPT_CLASSES = {
+    "building", "amenity", "historic", "industrial", "landuse",
+    "place", "highway", "railway", "tourism", "man_made",
+}
 
 _CATALOG_HEADERS = {
     "User-Agent": (
@@ -203,6 +218,80 @@ def _safe_image_url(url: str) -> str:
     return ""
 
 
+async def _geocode_nominatim(name: str, city: str) -> tuple[float, float] | None:
+    """Geocode an object name in a city using Nominatim.
+
+    Accepts district/neighbourhood level and more specific results.
+    Rejects city/administrative level results (too coarse to be useful).
+    Rate-limited to 1 req/sec to comply with Nominatim usage policy.
+    """
+    if _http_client is None:
+        return None
+
+    # Strip adjectives that confuse geocoding ("заброшенный завод X" → "завод X")
+    clean = re.sub(
+        r'\b(заброш\w+|бывш\w+|старый|старая|старое|недостроен\w+|бездейству\w+)\b',
+        '', name, flags=re.IGNORECASE,
+    ).strip()
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    if len(clean) < 3:
+        return None
+
+    query = f"{clean}, {city}, Россия"
+
+    async with _NOMINATIM_SEM:
+        try:
+            resp = await _http_client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": query, "format": "json", "limit": 1, "countrycodes": "ru,kz,by,ua"},
+                headers={"User-Agent": "UrbexTelegramBot/1.0 (open-source educational project)"},
+                timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
+            )
+            await asyncio.sleep(1.1)  # Nominatim: max 1 request per second
+
+            if resp.status_code != 200 or not resp.json():
+                return None
+
+            result = resp.json()[0]
+            lat = float(result["lat"])
+            lon = float(result["lon"])
+            r_type = result.get("type", "")
+            r_class = result.get("class", "")
+
+            # Reject results that are just city/region level
+            if r_type in _NOMINATIM_REJECT_TYPES:
+                logger.debug(f"Nominatim rejected '{name}': type={r_type}")
+                return None
+
+            # Accept only meaningful location classes
+            if r_class not in _NOMINATIM_ACCEPT_CLASSES:
+                # Still accept suburb/neighbourhood/quarter as useful districts
+                if r_type not in {"suburb", "neighbourhood", "quarter", "district", "borough"}:
+                    logger.debug(f"Nominatim rejected '{name}': class={r_class}, type={r_type}")
+                    return None
+
+            if not _in_cis_bounds(lat, lon):
+                return None
+
+            # Validate result is near the target city (within 2× the city bbox)
+            bbox = CITY_BBOXES.get(city)
+            if bbox:
+                west, south, east, north = map(float, bbox.split(","))
+                dlat = (north - south) * 1.0
+                dlon = (east - west) * 1.0
+                if not (south - dlat <= lat <= north + dlat and west - dlon <= lon <= east + dlon):
+                    logger.debug(f"Nominatim rejected '{name}': coords outside city area")
+                    return None
+
+            logger.info(f"Nominatim: '{name}' → {lat:.4f},{lon:.4f} ({r_class}/{r_type})")
+            return (lat, lon)
+
+        except Exception as e:
+            logger.debug(f"Nominatim error for '{name}': {type(e).__name__}")
+            await asyncio.sleep(1.1)
+            return None
+
+
 def _parse_catalog_page(html: str) -> list[dict]:
     """Parse urban3p.ru/objects catalog page into list of {id, name, region}."""
     seen: set[str] = set()
@@ -310,7 +399,7 @@ async def _fetch_urban3p_catalog(city: str, pool: asyncpg.Pool) -> list[dict]:
                         "lon": None,
                         "address": card["region"] or city,
                         "source_name": "Urban3P",
-                        "image": f"https://img04.urban3p.ru/up/o/{obj_id}/preview.jpg",
+                        "image": f"https://img04.urban3p.ru/up/o/{obj_id}/photo.jpg",
                         "osm_id": osm_id,
                     })
                     matched += 1
@@ -326,8 +415,22 @@ async def _fetch_urban3p_catalog(city: str, pool: asyncpg.Pool) -> list[dict]:
             logger.warning(f"urban3p catalog page {page}: {type(e).__name__}")
             consecutive_empty += 1
 
-    logger.info(f"urban3p catalog total: {len(objects)} objects for {city}")
-    return objects
+    # Geocode collected objects via Nominatim (rate-limited)
+    # Only objects that get usable coordinates are returned — "Москва" alone is not a location
+    geocoded: list[dict] = []
+    for obj in objects:
+        if len(geocoded) >= _GEOCODE_LIMIT:
+            break
+        coords = await _geocode_nominatim(obj["name"], city)
+        if coords:
+            obj["lat"], obj["lon"] = coords
+            obj["address"] = ""  # coords are more precise than region name
+            geocoded.append(obj)
+
+    logger.info(
+        f"urban3p catalog: {len(geocoded)} geocoded out of {len(objects)} found for {city}"
+    )
+    return geocoded
 
 
 async def _fetch_from_osm(city: str) -> list[dict]:
@@ -453,7 +556,7 @@ async def _scrape_object_page(url: str) -> dict:
         image = ""
         id_m = re.search(r'/object(\d+)', url)
         if id_m:
-            image = f"https://img04.urban3p.ru/up/o/{id_m.group(1)}/preview.jpg"
+            image = f"https://img04.urban3p.ru/up/o/{id_m.group(1)}/photo.jpg"
 
         if not image:
             img = re.search(
@@ -661,9 +764,10 @@ async def search_objects(
     )
 
     if not needs_refresh:
-        count = await get_object_count(pool, city)
+        # Use located count (objects with real coords) — objects with only "Москва" don't count
+        count = await get_located_object_count(pool, city)
         if count < _MIN_OBJECTS_THRESHOLD:
-            logger.info(f"City {city} has only {count} objects — forcing catalog refresh")
+            logger.info(f"City {city} has only {count} located objects — forcing refresh")
             needs_refresh = True
 
     if needs_refresh:
@@ -673,7 +777,7 @@ async def search_objects(
             async with lock:
                 # Re-check after acquiring lock (another coroutine may have just refreshed)
                 last_fetched = await get_city_last_fetched(pool, city)
-                count = await get_object_count(pool, city)
+                count = await get_located_object_count(pool, city)
                 still_needs = (
                     last_fetched is None
                     or (datetime.now(timezone.utc) - last_fetched).days >= CACHE_REFRESH_DAYS

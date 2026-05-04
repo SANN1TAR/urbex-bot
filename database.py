@@ -85,7 +85,9 @@ async def get_objects(
         rows = await conn.fetch(
             """SELECT id, name, lat, lon, address, image, source_name
                FROM objects
-               WHERE city = $1 AND NOT (id = ANY($2::int[]))
+               WHERE city = $1
+                 AND NOT (id = ANY($2::int[]))
+                 AND lat IS NOT NULL
                ORDER BY RANDOM()
                LIMIT $3""",
             city, list(shown_ids), limit,
@@ -136,6 +138,14 @@ async def get_object_count(pool: asyncpg.Pool, city: str) -> int:
     async with pool.acquire() as conn:
         return await conn.fetchval(
             "SELECT COUNT(*) FROM objects WHERE city = $1", city
+        )
+
+
+async def get_located_object_count(pool: asyncpg.Pool, city: str) -> int:
+    """Count only objects that have real coordinates (lat IS NOT NULL)."""
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM objects WHERE city = $1 AND lat IS NOT NULL", city
         )
 
 
