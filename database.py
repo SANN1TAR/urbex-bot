@@ -167,10 +167,10 @@ async def get_ungeocoded_objects(
 async def update_object_coords(
     pool: asyncpg.Pool, obj_id: int, lat: float, lon: float
 ) -> None:
-    """Set coordinates for an object and clear the generic city address."""
+    """Set coordinates for an object. Preserves existing address (region name)."""
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE objects SET lat = $1, lon = $2, address = '' WHERE id = $3",
+            "UPDATE objects SET lat = $1, lon = $2 WHERE id = $3",
             lat, lon, obj_id,
         )
 

@@ -234,6 +234,7 @@ async def geocode_nominatim(name: str, city: str) -> tuple[float, float] | None:
         '', name, flags=re.IGNORECASE,
     ).strip()
     clean = re.sub(r'\s+', ' ', clean).strip()
+    clean = re.sub(r'[\x00-\x1f]', '', clean)[:120]  # strip control chars, cap length
     if len(clean) < 3:
         return None
 
@@ -244,7 +245,7 @@ async def geocode_nominatim(name: str, city: str) -> tuple[float, float] | None:
             resp = await _http_client.get(
                 "https://nominatim.openstreetmap.org/search",
                 params={"q": query, "format": "json", "limit": 1, "countrycodes": "ru,kz,by,ua"},
-                headers={"User-Agent": "UrbexTelegramBot/1.0 (open-source educational project)"},
+                headers={"User-Agent": "UrbexTelegramBot/1.0 (https://github.com/SANN1TAR/urbex-bot)"},
                 timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
             )
             await asyncio.sleep(1.1)  # Nominatim: max 1 request per second
@@ -370,8 +371,11 @@ async def _fetch_urban3p_catalog(city: str, pool: asyncpg.Pool) -> list[dict]:
         base_params["region_id"] = region_id
 
     consecutive_empty = 0
+    consecutive_unmatched = 0  # pages with cards but 0 city matches (no-region_id mode)
     for page in range(1, max_pages + 1):
         if consecutive_empty >= 3:
+            break
+        if not region_id and consecutive_unmatched >= 5:
             break
         try:
             resp = await _http_client.get(
@@ -410,6 +414,8 @@ async def _fetch_urban3p_catalog(city: str, pool: asyncpg.Pool) -> list[dict]:
                     })
                     matched += 1
 
+                if not region_id:
+                    consecutive_unmatched = 0 if matched else consecutive_unmatched + 1
                 if matched:
                     logger.info(f"urban3p catalog p{page}: +{matched} for {city}")
             else:
@@ -763,19 +769,17 @@ async def search_objects(
             needs_refresh = True
 
     if needs_refresh:
-        # Per-city lock prevents concurrent duplicate fetches (background loop + user tap)
+        # Always acquire the lock — no TOCTOU. Double-check inside protects from double-fetch.
         lock = _city_fetch_locks.setdefault(city, asyncio.Lock())
-        if not lock.locked():
-            async with lock:
-                # Re-check after acquiring lock (another coroutine may have just refreshed)
-                last_fetched = await get_city_last_fetched(pool, city)
-                count = await get_located_object_count(pool, city)
-                still_needs = (
-                    last_fetched is None
-                    or (datetime.now(timezone.utc) - last_fetched).days >= CACHE_REFRESH_DAYS
-                    or count < _MIN_OBJECTS_THRESHOLD
-                )
-                if still_needs:
+        async with lock:
+            # Only re-check time condition — count < threshold is just a trigger,
+            # not a reason to re-fetch every call (avoids infinite refetch loop).
+            last_fetched = await get_city_last_fetched(pool, city)
+            still_needs = (
+                last_fetched is None
+                or (datetime.now(timezone.utc) - last_fetched).days >= CACHE_REFRESH_DAYS
+            )
+            if still_needs:
                     logger.info(f"Refreshing archive for {city} (last: {last_fetched})")
                     try:
                         new_objects = await _fetch_from_web(city, pool)

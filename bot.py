@@ -111,9 +111,11 @@ class ThrottlingMiddleware(BaseMiddleware):
                 if now - self._last_call.get(user.id, 0) < self.rate:
                     return
                 self._last_call[user.id] = now
-                # Prevent unbounded growth on high user counts
-                if len(self._last_call) > 50_000:
-                    self._last_call.clear()
+                # Evict oldest 20% when dict grows too large (LRU-style, no global clear)
+                if len(self._last_call) > 10_000:
+                    oldest = sorted(self._last_call.items(), key=lambda x: x[1])
+                    for uid, _ in oldest[:2_000]:
+                        del self._last_call[uid]
         return await handler(event, data)
 
 
@@ -423,7 +425,7 @@ async def _healthcheck_handler(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
     try:
-        await reader.read(1024)
+        await asyncio.wait_for(reader.read(1024), timeout=5.0)
         writer.write(
             b"HTTP/1.1 200 OK\r\n"
             b"Content-Type: text/plain\r\n"
@@ -476,10 +478,7 @@ async def main() -> None:
     finally:
         cache_task.cancel()
         geocode_task.cancel()
-        try:
-            await asyncio.gather(cache_task, geocode_task, return_exceptions=True)
-        except asyncio.CancelledError:
-            pass
+        await asyncio.gather(cache_task, geocode_task, return_exceptions=True)
         hc_server.close()
         await hc_server.wait_closed()
         await bot.session.close()
