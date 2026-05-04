@@ -44,11 +44,11 @@ VPN_NOTE = (
     "Если не открываются — врубай VPN."
 )
 
-STALE_NOTE = "⚡ Не серчай, инфа может быть устаревшей. Перед вылазкой перепроверь."
+STALE_NOTE = "⚡ Братишка, архив старый — инфа тоже. Перед вылазкой перепроверь местечко на всякий случай, ради своей же безопасности."
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🏚️ Заброшка")],
+        [KeyboardButton(text="🔍 Начать поиск")],
         [KeyboardButton(text="🏙️ Сменить город")],
     ],
     resize_keyboard=True,
@@ -56,13 +56,13 @@ MAIN_KB = ReplyKeyboardMarkup(
 
 BROWSING_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🏚️ Заброшка")],
-        [KeyboardButton(text="✖️ Завершить поиск")],
+        [KeyboardButton(text="➡️ Следующая")],
+        [KeyboardButton(text="❌ Закончить поиск")],
     ],
     resize_keyboard=True,
 )
 
-MENU_BUTTONS = {"🏚️ Заброшка", "🏙️ Сменить город", "✖️ Завершить поиск"}
+MENU_BUTTONS = {"🔍 Начать поиск", "🏙️ Сменить город", "➡️ Следующая", "❌ Закончить поиск"}
 OBJ_TYPE = "zabroshka"
 OBJ_TYPE_NAMES = {OBJ_TYPE: "заброшки"}
 
@@ -180,8 +180,9 @@ HELP_TEXT = """
 <b>🏚 Как пользоваться ботом</b>
 
 <b>Кнопки:</b>
-🏚️ <b>Заброшка</b> — начать поиск. Во время сессии: следующий объект.
-✖️ <b>Завершить поиск</b> — закончить сессию, вернуться в меню.
+🔍 <b>Начать поиск</b> — начать поиск заброшек в твоём городе.
+➡️ <b>Следующая</b> — следующий объект во время поиска.
+❌ <b>Закончить поиск</b> — выйти из поиска, вернуться в меню.
 🏙️ <b>Сменить город</b> — изменить город поиска.
 
 <b>Команды:</b>
@@ -208,8 +209,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     else:
         await message.answer(DISCLAIMER, parse_mode="HTML")
         await message.answer(
-            "Здорово, ёпта. Я тут из рода экскурсоводов — знаю почти все дыры в городе.\n\n"
-            "Из какого ты города? Пиши как угодно — МСК, МО, Питер, полное название.",
+            "Здарово, я твой гид по забросам 🚪\n\n"
+            "Ты скажи откуда ты, а я пока поищу что у меня в архиве завалялось.\n\n"
+            "Пиши как угодно — МСК, МО, Питер, полное название.",
             reply_markup=ReplyKeyboardRemove(),
         )
         await state.set_state(Reg.city)
@@ -235,15 +237,15 @@ async def reg_city(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     if not text or len(text) > _CITY_MAX_LEN or not _CITY_RE.match(text):
         await message.answer(
-            "Напиши нормальное название города (до 100 символов, только буквы и пробелы).",
+            "Ты из меня клоуна не строй — я и так перед тобой с этими бумагами кручусь. "
+            "Нормально напиши название города.",
             reply_markup=ReplyKeyboardRemove(),
         )
         return
     city = _resolve_city(text)
     await save_user(_pool, message.from_user.id, city)
     await state.clear()
-    await message.answer(VPN_NOTE, parse_mode="HTML")
-    await message.answer(f"{city} — знаю там пару мест. Чё ищешь?", reply_markup=MAIN_KB)
+    await message.answer(f"{city} — принял. Жми 🏚️ Заброшка.", reply_markup=MAIN_KB)
 
 
 async def _send_one(message: Message, obj: dict) -> None:
@@ -271,7 +273,7 @@ async def _show_next(message: Message, state: FSMContext) -> None:
     if not {"cache", "idx", "obj_type", "city"}.issubset(data.keys()):
         await state.clear()
         await message.answer(
-            "Сессия сброшена после перезапуска. Нажми 🏚️ Заброшка чтобы начать заново.",
+            "Сессия сброшена после перезапуска. Нажми 🔍 Начать поиск чтобы начать заново.",
             reply_markup=MAIN_KB,
         )
         return
@@ -292,7 +294,8 @@ async def _show_next(message: Message, state: FSMContext) -> None:
     if not objects:
         await state.clear()
         await message.answer(
-            "Показал всё что знаю 🏁\n\n"
+            "Всё, что скопилось в архиве — показал 🗂\n\n"
+            "Заходи позже, возможно что-то ещё появится.\n"
             "Нажми 🏚️ <b>Заброшка</b> чтобы начать заново.",
             parse_mode="HTML",
             reply_markup=MAIN_KB,
@@ -309,7 +312,7 @@ async def _start_session(message: Message, state: FSMContext, obj_type: str, cit
     uid = message.from_user.id
     await reset_shown(_pool, uid)
 
-    await message.answer(f"Ща пробью {OBJ_TYPE_NAMES[obj_type]} в {city}... 🔍")
+    await message.answer(f"{city} — знаю там пару мест. Ну что, начинаю искать... 🔍")
     objects = await search_objects(_pool, obj_type, city, set())
 
     if not objects:
@@ -334,12 +337,12 @@ async def _start_session(message: Message, state: FSMContext, obj_type: str, cit
     await _send_one(message, objects[0])
 
 
-@dp.message(F.text == "🏚️ Заброшка", Browsing.active)
+@dp.message(F.text == "➡️ Следующая", Browsing.active)
 async def handle_next_in_session(message: Message, state: FSMContext) -> None:
     await _show_next(message, state)
 
 
-@dp.message(F.text == "🏚️ Заброшка")
+@dp.message(F.text == "🔍 Начать поиск")
 async def handle_zabroshka(message: Message, state: FSMContext) -> None:
     user = await _require_user(message)
     if not user:
@@ -348,10 +351,10 @@ async def handle_zabroshka(message: Message, state: FSMContext) -> None:
     await _start_session(message, state, OBJ_TYPE, user["city"])
 
 
-@dp.message(F.text == "✖️ Завершить поиск")
+@dp.message(F.text == "❌ Закончить поиск")
 async def handle_stop_browsing(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Завершил. Когда захочешь — нажми 🏚️ Заброшка.", reply_markup=MAIN_KB)
+    await message.answer("Закончили. Когда захочешь — нажми 🔍 Начать поиск.", reply_markup=MAIN_KB)
 
 
 @dp.message(F.text == "🏙️ Сменить город")
