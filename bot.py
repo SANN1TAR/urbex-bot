@@ -19,8 +19,11 @@ from aiogram.types import (
 )
 
 from config import get_config
-from database import get_user, init_db, save_user, mark_shown, get_shown_ids, reset_shown
-from search import search_objects, init_search, close_http_client
+from database import (
+    get_user, init_db, save_user, mark_shown, get_shown_ids, reset_shown,
+    get_ungeocoded_objects, update_object_coords,
+)
+from search import search_objects, init_search, close_http_client, geocode_nominatim
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -356,6 +359,39 @@ async def handle_change_city(message: Message, state: FSMContext) -> None:
     await state.set_state(Reg.city)
 
 
+async def _geocode_loop(pool: asyncpg.Pool) -> None:
+    """Background task: incrementally geocode catalog objects that lack coordinates.
+
+    Runs every hour, processes 15 objects per city via Nominatim (1 req/sec).
+    Over 24 h a city accumulates ~15 × 24 × 40% ≈ 144 new located objects.
+    """
+    error_delay = 300
+    while True:
+        try:
+            async with pool.acquire() as conn:
+                cities = [r["city"] for r in await conn.fetch("SELECT DISTINCT city FROM users")]
+
+            for city in cities:
+                objects = await get_ungeocoded_objects(pool, city, limit=15)
+                geocoded = 0
+                for obj in objects:
+                    coords = await geocode_nominatim(obj["name"], city)
+                    if coords:
+                        await update_object_coords(pool, obj["id"], *coords)
+                        geocoded += 1
+                if geocoded:
+                    logger.info(f"Geocode loop: +{geocoded} coords for {city}")
+
+            error_delay = 300
+            await asyncio.sleep(3600)  # run every hour
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Geocode loop error (retry in {error_delay}s): {type(e).__name__}")
+            await asyncio.sleep(error_delay)
+            error_delay = min(error_delay * 2, 3600)
+
+
 async def _refresh_cache_loop(pool: asyncpg.Pool) -> None:
     error_delay = 300
     while True:
@@ -434,12 +470,14 @@ async def main() -> None:
     logger.info(f"Healthcheck listening on :{port}")
 
     cache_task = asyncio.create_task(_refresh_cache_loop(_pool))
+    geocode_task = asyncio.create_task(_geocode_loop(_pool))
     try:
         await dp.start_polling(bot)
     finally:
         cache_task.cancel()
+        geocode_task.cancel()
         try:
-            await cache_task
+            await asyncio.gather(cache_task, geocode_task, return_exceptions=True)
         except asyncio.CancelledError:
             pass
         hc_server.close()

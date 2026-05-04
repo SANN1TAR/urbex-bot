@@ -218,7 +218,7 @@ def _safe_image_url(url: str) -> str:
     return ""
 
 
-async def _geocode_nominatim(name: str, city: str) -> tuple[float, float] | None:
+async def geocode_nominatim(name: str, city: str) -> tuple[float, float] | None:
     """Geocode an object name in a city using Nominatim.
 
     Accepts district/neighbourhood level and more specific results.
@@ -350,7 +350,11 @@ async def _find_region_id(city: str) -> str | None:
 
 
 async def _fetch_urban3p_catalog(city: str, pool: asyncpg.Pool) -> list[dict]:
-    """Paginate urban3p.ru catalog and collect objects matching the city."""
+    """Paginate urban3p.ru catalog and collect objects matching the city.
+
+    Objects are saved without coordinates — the background geocoder in bot.py
+    adds coordinates incrementally (15 objects/hour via Nominatim).
+    """
     if _http_client is None:
         return []
     search_terms = CITY_SEARCH_TERMS.get(city, [city.lower()])
@@ -358,7 +362,9 @@ async def _fetch_urban3p_catalog(city: str, pool: asyncpg.Pool) -> list[dict]:
     seen_ids: set[str] = set()
 
     region_id = await _find_region_id(city)
-    max_pages = 100 if region_id else 30
+    # With region filter: scan up to 200 pages (2000 objects)
+    # Without: scan 80 pages of general catalog with local city filter
+    max_pages = 200 if region_id else 80
     base_params: dict = {}
     if region_id:
         base_params["region_id"] = region_id
@@ -415,22 +421,8 @@ async def _fetch_urban3p_catalog(city: str, pool: asyncpg.Pool) -> list[dict]:
             logger.warning(f"urban3p catalog page {page}: {type(e).__name__}")
             consecutive_empty += 1
 
-    # Geocode collected objects via Nominatim (rate-limited)
-    # Only objects that get usable coordinates are returned — "Москва" alone is not a location
-    geocoded: list[dict] = []
-    for obj in objects:
-        if len(geocoded) >= _GEOCODE_LIMIT:
-            break
-        coords = await _geocode_nominatim(obj["name"], city)
-        if coords:
-            obj["lat"], obj["lon"] = coords
-            obj["address"] = ""  # coords are more precise than region name
-            geocoded.append(obj)
-
-    logger.info(
-        f"urban3p catalog: {len(geocoded)} geocoded out of {len(objects)} found for {city}"
-    )
-    return geocoded
+    logger.info(f"urban3p catalog collected {len(objects)} objects for {city} (geocoding deferred)")
+    return objects
 
 
 async def _fetch_from_osm(city: str) -> list[dict]:

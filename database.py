@@ -149,6 +149,32 @@ async def get_located_object_count(pool: asyncpg.Pool, city: str) -> int:
         )
 
 
+async def get_ungeocoded_objects(
+    pool: asyncpg.Pool, city: str, limit: int = 15
+) -> list[dict]:
+    """Return objects that have no coordinates yet, ordered newest first."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, name FROM objects
+               WHERE city = $1 AND lat IS NULL
+               ORDER BY created_at DESC
+               LIMIT $2""",
+            city, limit,
+        )
+    return [{"id": r["id"], "name": r["name"]} for r in rows]
+
+
+async def update_object_coords(
+    pool: asyncpg.Pool, obj_id: int, lat: float, lon: float
+) -> None:
+    """Set coordinates for an object and clear the generic city address."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE objects SET lat = $1, lon = $2, address = '' WHERE id = $3",
+            lat, lon, obj_id,
+        )
+
+
 async def get_city_last_fetched(pool: asyncpg.Pool, city: str) -> datetime | None:
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
